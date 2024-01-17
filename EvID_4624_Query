@@ -1,0 +1,13 @@
+# Define the start and end time for the query (24 hours ago to now)
+$startTime = (Get-Date).AddDays(-1)
+$endTime = Get-Date
+
+# Specify the log and ID for login events
+$logName = "Security"
+$id = 4624
+
+# Use Get-WinEvent to retrieve the login events
+$loginEvents = Get-WinEvent -FilterHashtable @{ LogName=$logName; ID=$id; StartTime=$startTime; EndTime=$endTime }
+
+# Display the login events
+$loginEvents | Format-List TimeCreated, ProviderName, Id, Message
