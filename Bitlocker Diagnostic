@@ -1,0 +1,952 @@
+#Requires -RunAsAdministrator
+
+<#
+.SYNOPSIS
+    Systematically diagnoses issues preventing BitLocker from functioning correctly on a Windows system.
+
+.DESCRIPTION
+    This script performs comprehensive BitLocker diagnostics including:
+    - BitLocker volume encryption status verification
+    - TPM hardware readiness assessment
+    - Group Policy analysis for BitLocker controls
+    - Recovery key configuration validation
+    - Service status verification
+    - Event log analysis for troubleshooting
+    - Key protector enumeration and validation
+
+.NOTES
+    Author: Stefan T.
+    Requires: Administrator privileges
+    Version: 1.0
+    
+.PARAMETER ExportResults
+    Export detailed results to JSON file
+    
+.PARAMETER Detailed
+    Show detailed diagnostic information
+    
+.PARAMETER CheckADBackup
+    Verify Active Directory backup of recovery keys
+#>
+
+param(
+    [switch]$ExportResults,
+    [switch]$Detailed,
+    [switch]$CheckADBackup
+)
+
+# Initialize comprehensive results object
+$BitLockerDiagnostics = [PSCustomObject]@{
+    Timestamp = Get-Date
+    ComputerName = $env:COMPUTERNAME
+    VolumeStatus = $null
+    TPMStatus = $null
+    GroupPolicySettings = $null
+    RecoveryKeyStatus = $null
+    ServiceStatus = $null
+    EventLogAnalysis = $null
+    KeyProtectorStatus = $null
+    OverallStatus = "Unknown"
+    CriticalIssues = @()
+    Warnings = @()
+    Recommendations = @()
+}
+
+# Color-coded output function
+function Write-DiagnosticMessage {
+    param(
+        [string]$Message,
+        [ValidateSet("Info", "Success", "Warning", "Error", "Critical")]
+        [string]$Type = "Info"
+    )
+    
+    $colors = @{
+        "Info" = "Cyan"
+        "Success" = "Green"
+        "Warning" = "Yellow" 
+        "Error" = "Red"
+        "Critical" = "Magenta"
+    }
+    
+    Write-Host "[$Type] " -ForegroundColor $colors[$Type] -NoNewline
+    Write-Host $Message
+}
+
+function Test-IsAdministrator {
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($currentUser)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# Step 1: Check BitLocker Volume Status
+function Test-BitLockerVolumeStatus {
+    Write-DiagnosticMessage "Step 1: Checking BitLocker Volume Status..." -Type "Info"
+    
+    $volumeStatusResults = [PSCustomObject]@{
+        Volumes = @()
+        TotalVolumes = 0
+        EncryptedVolumes = 0
+        PartiallyEncryptedVolumes = 0
+        UnencryptedVolumes = 0
+        Issues = @()
+    }
+    
+    try {
+        $bitlockerVolumes = Get-BitLockerVolume -ErrorAction SilentlyContinue
+        
+        if (-not $bitlockerVolumes) {
+            $volumeStatusResults.Issues += "No BitLocker volumes found - BitLocker may not be supported or enabled"
+            Write-DiagnosticMessage "No BitLocker volumes detected" -Type "Error"
+            return $volumeStatusResults
+        }
+        
+        $volumeStatusResults.TotalVolumes = $bitlockerVolumes.Count
+        
+        foreach ($volume in $bitlockerVolumes) {
+            $volumeDetail = [PSCustomObject]@{
+                MountPoint = $volume.MountPoint
+                VolumeType = $volume.VolumeType
+                ProtectionStatus = $volume.ProtectionStatus
+                LockStatus = $volume.LockStatus
+                EncryptionMethod = $volume.EncryptionMethod
+                EncryptionPercentage = $volume.EncryptionPercentage
+                VolumeStatus = $volume.VolumeStatus
+                KeyProtectorCount = $volume.KeyProtector.Count
+            }
+            
+            # Categorize volume status
+            switch ($volume.VolumeStatus) {
+                "FullyEncrypted" { 
+                    $volumeStatusResults.EncryptedVolumes++
+                    Write-DiagnosticMessage "Volume $($volume.MountPoint): Fully Encrypted" -Type "Success"
+                }
+                "EncryptionInProgress" { 
+                    $volumeStatusResults.PartiallyEncryptedVolumes++
+                    Write-DiagnosticMessage "Volume $($volume.MountPoint): Encryption In Progress ($($volume.EncryptionPercentage)%)" -Type "Warning"
+                }
+                "DecryptionInProgress" { 
+                    $volumeStatusResults.PartiallyEncryptedVolumes++
+                    Write-DiagnosticMessage "Volume $($volume.MountPoint): Decryption In Progress ($($volume.EncryptionPercentage)%)" -Type "Warning"
+                }
+                "FullyDecrypted" { 
+                    $volumeStatusResults.UnencryptedVolumes++
+                    Write-DiagnosticMessage "Volume $($volume.MountPoint): Not Encrypted" -Type "Error"
+                }
+                default {
+                    $volumeStatusResults.Issues += "Volume $($volume.MountPoint) has unknown status: $($volume.VolumeStatus)"
+                    Write-DiagnosticMessage "Volume $($volume.MountPoint): Unknown Status - $($volume.VolumeStatus)" -Type "Warning"
+                }
+            }
+            
+            # Check protection status
+            if ($volume.ProtectionStatus -eq "Off") {
+                $volumeStatusResults.Issues += "Volume $($volume.MountPoint) protection is disabled"
+                Write-DiagnosticMessage "Volume $($volume.MountPoint): Protection is OFF" -Type "Error"
+            }
+            
+            $volumeStatusResults.Volumes += $volumeDetail
+        }
+        
+        Write-DiagnosticMessage "Found $($volumeStatusResults.TotalVolumes) volumes: $($volumeStatusResults.EncryptedVolumes) encrypted, $($volumeStatusResults.UnencryptedVolumes) unencrypted" -Type "Info"
+        
+        return $volumeStatusResults
+    }
+    catch {
+        $volumeStatusResults.Issues += "Failed to check BitLocker volume status: $($_.Exception.Message)"
+        Write-DiagnosticMessage "Failed to check BitLocker volumes: $($_.Exception.Message)" -Type "Error"
+        return $volumeStatusResults
+    }
+}
+
+# Step 2: Assess TPM Hardware Status
+function Test-TPMStatus {
+    Write-DiagnosticMessage "Step 2: Assessing TPM Hardware Status..." -Type "Info"
+    
+    $tpmStatusResults = [PSCustomObject]@{
+        TPMPresent = $false
+        IsActivated = $false
+        IsEnabled = $false
+        SpecVersion = $null
+        ManufacturerVersion = $null
+        IsOwned = $false
+        IsReady = $false
+        Issues = @()
+    }
+    
+    try {
+        # Try modern TPM cmdlets first
+        try {
+            $tpm = Get-Tpm -ErrorAction SilentlyContinue
+            if ($tpm) {
+                $tpmStatusResults.TPMPresent = $tpm.TpmPresent
+                $tmpStatusResults.IsActivated = $tpm.TpmActivated
+                $tpmStatusResults.IsEnabled = $tpm.TmpEnabled
+                $tpmStatusResults.IsOwned = $tpm.TpmOwned
+                $tpmStatusResults.IsReady = $tpm.TmpReady
+                
+                Write-DiagnosticMessage "TPM Status: Present=$($tpm.TmpPresent), Activated=$($tpm.TmpActivated), Enabled=$($tpm.TmpEnabled)" -Type "Success"
+            }
+        }
+        catch {
+            # Fall back to WMI method
+            Write-DiagnosticMessage "Using WMI fallback for TPM detection..." -Type "Info"
+        }
+        
+        # WMI method for older systems or additional details
+        $tpmWmi = Get-WmiObject -Namespace "Root\CIMv2\Security\MicrosoftTpm" -Class Win32_Tpm -ErrorAction SilentlyContinue
+        
+        if ($tpmWmi) {
+            $tpmStatusResults.TPMPresent = $true
+            $tpmStatusResults.IsActivated = $tpmWmi.IsActivated_InitialValue
+            $tmpStatusResults.IsEnabled = $tpmWmi.IsEnabled_InitialValue
+            $tpmStatusResults.SpecVersion = $tpmWmi.SpecVersion
+            $tmpStatusResults.ManufacturerVersion = $tpmWmi.ManufacturerVersion
+            
+            Write-DiagnosticMessage "TPM detected via WMI - Spec Version: $($tpmWmi.SpecVersion)" -Type "Success"
+        } else {
+            $tpmStatusResults.Issues += "No TPM hardware detected"
+            Write-DiagnosticMessage "No TPM hardware found" -Type "Critical"
+            return $tpmStatusResults
+        }
+        
+        # Validate TPM readiness for BitLocker
+        if (-not $tpmStatusResults.IsActivated) {
+            $tpmStatusResults.Issues += "TPM is not activated"
+            Write-DiagnosticMessage "TPM is not activated - BitLocker may not function properly" -Type "Error"
+        }
+        
+        if (-not $tpmStatusResults.IsEnabled) {
+            $tpmStatusResults.Issues += "TPM is not enabled"
+            Write-DiagnosticMessage "TPM is not enabled - Enable in BIOS/UEFI settings" -Type "Error"
+        }
+        
+        # Check TPM ownership
+        try {
+            $tpmOwnership = (Get-WmiObject -Namespace "Root\CIMv2\Security\MicrosoftTpm" -Class Win32_Tpm).IsOwned_InitialValue
+            $tpmStatusResults.IsOwned = $tpmOwnership
+            
+            if (-not $tpmOwnership) {
+                $tpmStatusResults.Issues += "TPM is not owned - run 'Initialize-Tpm' to take ownership"
+                Write-DiagnosticMessage "TPM is not owned" -Type "Warning"
+            }
+        }
+        catch {
+            Write-DiagnosticMessage "Could not determine TPM ownership status" -Type "Warning"
+        }
+        
+        return $tpmStatusResults
+    }
+    catch {
+        $tpmStatusResults.Issues += "Failed to assess TPM status: $($_.Exception.Message)"
+        Write-DiagnosticMessage "Failed to assess TPM: $($_.Exception.Message)" -Type "Error"
+        return $tpmStatusResults
+    }
+}
+
+# Step 3: Query Group Policy BitLocker Settings
+function Test-GroupPolicySettings {
+    Write-DiagnosticMessage "Step 3: Analyzing Group Policy BitLocker Settings..." -Type "Info"
+    
+    $groupPolicyResults = [PSCustomObject]@{
+        PolicyKeysFound = 0
+        ActivePolicies = @{}
+        ConflictingSettings = @()
+        Issues = @()
+    }
+    
+    try {
+        $fveRegistryPath = "HKLM:\SOFTWARE\Policies\Microsoft\FVE"
+        
+        if (-not (Test-Path $fveRegistryPath)) {
+            Write-DiagnosticMessage "No BitLocker Group Policy settings found" -Type "Info"
+            return $groupPolicyResults
+        }
+        
+        $policySettings = Get-ItemProperty $fveRegistryPath -ErrorAction SilentlyContinue
+        
+        if ($policySettings) {
+            # Key BitLocker policies to check
+            $importantPolicies = @{
+                "UseTPM" = "Require TPM for BitLocker"
+                "UseTPMPIN" = "Require TPM + PIN"
+                "UseTPMKey" = "Require TPM + USB Key"
+                "UseTPMKeyPIN" = "Require TPM + USB Key + PIN"
+                "RequireActiveDirectoryBackup" = "Require AD backup of recovery info"
+                "EncryptionMethodWithXtsFdv" = "Encryption method for fixed drives"
+                "EncryptionMethodWithXtsOs" = "Encryption method for OS drives"
+                "DisableBDEWithNoTPM" = "Disable BitLocker without TPM"
+                "EnableBDEWithNoTPM" = "Enable BitLocker without TPM"
+            }
+            
+            foreach ($policy in $importantPolicies.Keys) {
+                if ($policySettings.PSObject.Properties.Name -contains $policy) {
+                    $value = $policySettings.$policy
+                    $groupPolicyResults.ActivePolicies[$policy] = $value
+                    $groupPolicyResults.PolicyKeysFound++
+                    
+                    Write-DiagnosticMessage "Policy: $($importantPolicies[$policy]) = $value" -Type "Info"
+                    
+                    # Check for potentially problematic settings
+                    if ($policy -eq "DisableBDEWithNoTPM" -and $value -eq 1) {
+                        $groupPolicyResults.ConflictingSettings += "BitLocker is disabled when TPM is not available"
+                        Write-DiagnosticMessage "CONFLICT: BitLocker disabled without TPM" -Type "Warning"
+                    }
+                    
+                    if ($policy -eq "RequireActiveDirectoryBackup" -and $value -eq 1) {
+                        Write-DiagnosticMessage "AD backup required - ensure domain connectivity" -Type "Warning"
+                    }
+                }
+            }
+            
+            # Check for additional registry values
+            $allProperties = $policySettings.PSObject.Properties | Where-Object { $_.Name -notlike "PS*" }
+            foreach ($prop in $allProperties) {
+                if (-not $importantPolicies.ContainsKey($prop.Name)) {
+                    $groupPolicyResults.ActivePolicies[$prop.Name] = $prop.Value
+                    Write-DiagnosticMessage "Additional Policy: $($prop.Name) = $($prop.Value)" -Type "Info"
+                }
+            }
+        }
+        
+        Write-DiagnosticMessage "Found $($groupPolicyResults.PolicyKeysFound) active BitLocker policies" -Type "Success"
+        
+        return $groupPolicyResults
+    }
+    catch {
+        $groupPolicyResults.Issues += "Failed to read Group Policy settings: $($_.Exception.Message)"
+        Write-DiagnosticMessage "Failed to read Group Policy: $($_.Exception.Message)" -Type "Error"
+        return $groupPolicyResults
+    }
+}
+
+# Step 4: Validate Recovery Key Configuration
+function Test-RecoveryKeyStatus {
+    Write-DiagnosticMessage "Step 4: Validating Recovery Key Configuration..." -Type "Info"
+    
+    $recoveryKeyResults = [PSCustomObject]@{
+        VolumeKeys = @()
+        TotalRecoveryKeys = 0
+        MissingKeys = @()
+        BackupStatus = @()
+        Issues = @()
+    }
+    
+    try {
+        $bitlockerVolumes = Get-BitLockerVolume -ErrorAction SilentlyContinue
+        
+        foreach ($volume in $bitlockerVolumes) {
+            $volumeKeyInfo = [PSCustomObject]@{
+                MountPoint = $volume.MountPoint
+                RecoveryPasswords = @()
+                ExternalKeys = @()
+                TPMProtectors = @()
+                HasRecoveryKey = $false
+            }
+            
+            # Analyze key protectors
+            foreach ($protector in $volume.KeyProtector) {
+                switch ($protector.KeyProtectorType) {
+                    "RecoveryPassword" {
+                        $volumeKeyInfo.RecoveryPasswords += $protector.KeyProtectorId
+                        $volumeKeyInfo.HasRecoveryKey = $true
+                        Write-DiagnosticMessage "Volume $($volume.MountPoint): Recovery password found" -Type "Success"
+                    }
+                    "ExternalKey" {
+                        $volumeKeyInfo.ExternalKeys += $protector.KeyProtectorId
+                        Write-DiagnosticMessage "Volume $($volume.MountPoint): External key found" -Type "Info"
+                    }
+                    "Tpm" {
+                        $volumeKeyInfo.TPMProtectors += $protector.KeyProtectorId
+                        Write-DiagnosticMessage "Volume $($volume.MountPoint): TPM protector found" -Type "Success"
+                    }
+                    default {
+                        Write-DiagnosticMessage "Volume $($volume.MountPoint): $($protector.KeyProtectorType) protector found" -Type "Info"
+                    }
+                }
+            }
+            
+            if (-not $volumeKeyInfo.HasRecoveryKey) {
+                $recoveryKeyResults.MissingKeys += $volume.MountPoint
+                $recoveryKeyResults.Issues += "Volume $($volume.MountPoint) has no recovery password"
+                Write-DiagnosticMessage "Volume $($volume.MountPoint): NO RECOVERY PASSWORD" -Type "Critical"
+            } else {
+                $recoveryKeyResults.TotalRecoveryKeys += $volumeKeyInfo.RecoveryPasswords.Count
+            }
+            
+            # Check AD backup if requested
+            if ($CheckADBackup) {
+                try {
+                    $adBackupStatus = & manage-bde -protectors -get $volume.MountPoint 2>$null | Select-String "Backup to AD DS"
+                    if ($adBackupStatus) {
+                        $recoveryKeyResults.BackupStatus += "Volume $($volume.MountPoint): AD backup configured"
+                        Write-DiagnosticMessage "Volume $($volume.MountPoint): AD backup configured" -Type "Success"
+                    } else {
+                        $recoveryKeyResults.Issues += "Volume $($volume.MountPoint) recovery key not backed up to AD"
+                        Write-DiagnosticMessage "Volume $($volume.MountPoint): No AD backup found" -Type "Warning"
+                    }
+                }
+                catch {
+                    Write-DiagnosticMessage "Could not verify AD backup status for $($volume.MountPoint)" -Type "Warning"
+                }
+            }
+            
+            $recoveryKeyResults.VolumeKeys += $volumeKeyInfo
+        }
+        
+        return $recoveryKeyResults
+    }
+    catch {
+        $recoveryKeyResults.Issues += "Failed to validate recovery keys: $($_.Exception.Message)"
+        Write-DiagnosticMessage "Failed to check recovery keys: $($_.Exception.Message)" -Type "Error"
+        return $recoveryKeyResults
+    }
+}
+
+# Step 5: Test BitLocker Service Status
+function Test-BitLockerServices {
+    Write-DiagnosticMessage "Step 5: Testing BitLocker Service Status..." -Type "Info"
+    
+    $serviceResults = [PSCustomObject]@{
+        ServicesChecked = 0
+        RunningServices = 0
+        StoppedServices = 0
+        ServiceDetails = @()
+        Issues = @()
+    }
+    
+    $requiredServices = @(
+        "BDESVC",           # BitLocker Drive Encryption Service
+        "TrustedInstaller", # Windows Modules Installer
+        "VSS",              # Volume Shadow Copy
+        "swprv",            # Microsoft Software Shadow Copy Provider
+        "TPMBaseServices"   # TPM Base Services (if TPM present)
+    )
+    
+    foreach ($serviceName in $requiredServices) {
+        try {
+            $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            
+            if ($service) {
+                $serviceDetail = [PSCustomObject]@{
+                    ServiceName = $service.Name
+                    DisplayName = $service.DisplayName
+                    Status = $service.Status
+                    StartType = $service.StartType
+                    CanStart = $true
+                }
+                
+                $serviceResults.ServicesChecked++
+                
+                if ($service.Status -eq "Running") {
+                    $serviceResults.RunningServices++
+                    Write-DiagnosticMessage "$($service.DisplayName): Running" -Type "Success"
+                } else {
+                    $serviceResults.StoppedServices++
+                    
+                    # Critical services that must be running
+                    if ($serviceName -eq "BDESVC") {
+                        $serviceResults.Issues += "BitLocker Drive Encryption Service is not running"
+                        Write-DiagnosticMessage "$($service.DisplayName): STOPPED (CRITICAL)" -Type "Critical"
+                    } else {
+                        $serviceResults.Issues += "$($service.DisplayName) is not running"
+                        Write-DiagnosticMessage "$($service.DisplayName): Stopped" -Type "Warning"
+                    }
+                }
+                
+                # Check if service can be started
+                if ($service.StartType -eq "Disabled") {
+                    $serviceDetail.CanStart = $false
+                    $serviceResults.Issues += "$($service.DisplayName) is disabled"
+                    Write-DiagnosticMessage "$($service.DisplayName): Service is DISABLED" -Type "Error"
+                }
+                
+                $serviceResults.ServiceDetails += $serviceDetail
+            } else {
+                # TPM service might not exist on systems without TPM
+                if ($serviceName -ne "TPMBaseServices") {
+                    $serviceResults.Issues += "Required service not found: $serviceName"
+                    Write-DiagnosticMessage "Service not found: $serviceName" -Type "Error"
+                }
+            }
+        }
+        catch {
+            $serviceResults.Issues += "Failed to check service $serviceName : $($_.Exception.Message)"
+            Write-DiagnosticMessage "Failed to check $serviceName : $($_.Exception.Message)" -Type "Error"
+        }
+    }
+    
+    return $serviceResults
+}
+
+# Step 6: Inspect Event Logs for Errors
+function Test-BitLockerEventLogs {
+    Write-DiagnosticMessage "Step 6: Inspecting Event Logs for BitLocker Errors..." -Type "Info"
+    
+    $eventLogResults = [PSCustomObject]@{
+        CriticalErrors = 0
+        Warnings = 0
+        RecentEvents = @()
+        ImportantEventIDs = @()
+        Issues = @()
+    }
+    
+    try {
+        # Define important BitLocker event sources and IDs
+        $logSources = @(
+            @{LogName = "Microsoft-Windows-BitLocker/BitLocker Management"; EventIDs = @(24577, 24578, 24579, 24580, 24588)},
+            @{LogName = "Microsoft-Windows-BitLocker-Driver/Admin"; EventIDs = @(24616, 24617, 24618)},
+            @{LogName = "System"; EventIDs = @(851, 775, 796, 24588)},
+            @{LogName = "Application"; EventIDs = @(1000, 1001)}
+        )
+        
+        $startTime = (Get-Date).AddDays(-7)  # Check last 7 days
+        
+        foreach ($logSource in $logSources) {
+            try {
+                $events = Get-WinEvent -LogName $logSource.LogName -MaxEvents 50 -ErrorAction SilentlyContinue | 
+                    Where-Object { 
+                        $_.TimeCreated -gt $startTime -and 
+                        ($logSource.EventIDs -contains $_.Id -or $_.Message -like "*BitLocker*" -or $_.Message -like "*BDE*")
+                    }
+                
+                foreach ($event in $events) {
+                    $eventDetail = [PSCustomObject]@{
+                        LogName = $logSource.LogName
+                        EventID = $event.Id
+                        Level = $event.LevelDisplayName
+                        TimeCreated = $event.TimeCreated
+                        Source = $event.ProviderName
+                        Message = $event.Message.Substring(0, [Math]::Min(300, $event.Message.Length))
+                    }
+                    
+                    # Categorize by severity
+                    if ($event.Level -eq 2) {  # Error
+                        $eventLogResults.CriticalErrors++
+                        Write-DiagnosticMessage "CRITICAL: Event ID $($event.Id) at $($event.TimeCreated)" -Type "Critical"
+                        
+                        # Check for specific critical BitLocker errors
+                        if ($event.Id -eq 24588) {
+                            $eventLogResults.Issues += "BitLocker encryption failed (Event 24588)"
+                        } elseif ($event.Id -eq 851) {
+                            $eventLogResults.Issues += "TPM initialization failed (Event 851)"
+                        }
+                    } elseif ($event.Level -eq 3) {  # Warning
+                        $eventLogResults.Warnings++
+                        Write-DiagnosticMessage "WARNING: Event ID $($event.Id) at $($event.TimeCreated)" -Type "Warning"
+                    }
+                    
+                    # Track important event IDs
+                    if (-not ($eventLogResults.ImportantEventIDs -contains $event.Id)) {
+                        $eventLogResults.ImportantEventIDs += $event.Id
+                    }
+                    
+                    $eventLogResults.RecentEvents += $eventDetail
+                }
+            }
+            catch {
+                # Log might not exist, continue silently
+                continue
+            }
+        }
+        
+        Write-DiagnosticMessage "Found $($eventLogResults.CriticalErrors) critical errors and $($eventLogResults.Warnings) warnings in BitLocker logs" -Type "Info"
+        
+        return $eventLogResults
+    }
+    catch {
+        $eventLogResults.Issues += "Failed to analyze event logs: $($_.Exception.Message)"
+        Write-DiagnosticMessage "Failed to analyze event logs: $($_.Exception.Message)" -Type "Error"
+        return $eventLogResults
+    }
+}
+
+# Step 7: Enumerate Protectors & Validate Their Integrity
+function Test-KeyProtectorIntegrity {
+    Write-DiagnosticMessage "Step 7: Enumerating Key Protectors & Validating Integrity..." -Type "Info"
+    
+    $protectorResults = [PSCustomObject]@{
+        VolumeProtectors = @()
+        TotalProtectors = 0
+        ValidProtectors = 0
+        InvalidProtectors = 0
+        ProtectorTypes = @{}
+        Issues = @()
+    }
+    
+    try {
+        $bitlockerVolumes = Get-BitLockerVolume -ErrorAction SilentlyContinue
+        
+        foreach ($volume in $bitlockerVolumes) {
+            $volumeProtectorInfo = [PSCustomObject]@{
+                MountPoint = $volume.MountPoint
+                Protectors = @()
+                ProtectorCount = $volume.KeyProtector.Count
+                ValidProtectorCount = 0
+                Issues = @()
+            }
+            
+            Write-DiagnosticMessage "Analyzing protectors for volume $($volume.MountPoint)..." -Type "Info"
+            
+            foreach ($protector in $volume.KeyProtector) {
+                $protectorDetail = [PSCustomObject]@{
+                    KeyProtectorId = $protector.KeyProtectorId
+                    KeyProtectorType = $protector.KeyProtectorType
+                    IsValid = $true
+                    ValidationMessage = "OK"
+                }
+                
+                $protectorResults.TotalProtectors++
+                
+                # Count protector types
+                if ($protectorResults.ProtectorTypes.ContainsKey($protector.KeyProtectorType)) {
+                    $protectorResults.ProtectorTypes[$protector.KeyProtectorType]++
+                } else {
+                    $protectorResults.ProtectorTypes[$protector.KeyProtectorType] = 1
+                }
+                
+                # Validate protector based on type
+                switch ($protector.KeyProtectorType) {
+                    "RecoveryPassword" {
+                        if ($protector.RecoveryPassword) {
+                            Write-DiagnosticMessage "Recovery Password protector: Valid" -Type "Success"
+                            $volumeProtectorInfo.ValidProtectorCount++
+                            $protectorResults.ValidProtectors++
+                        } else {
+                            $protectorDetail.IsValid = $false
+                            $protectorDetail.ValidationMessage = "Recovery password is null or empty"
+                            $protectorResults.InvalidProtectors++
+                            Write-DiagnosticMessage "Recovery Password protector: INVALID" -Type "Error"
+                        }
+                    }
+                    "Tpm" {
+                        # Validate TPM protector by checking TPM presence
+                        $tpmPresent = Get-WmiObject -Namespace "Root\CIMv2\Security\MicrosoftTpm" -Class Win32_Tpm -ErrorAction SilentlyContinue
+                        if ($tpmPresent) {
+                            Write-DiagnosticMessage "TPM protector: Valid" -Type "Success"
+                            $volumeProtectorInfo.ValidProtectorCount++
+                            $protectorResults.ValidProtectors++
+                        } else {
+                            $protectorDetail.IsValid = $false
+                            $protectorDetail.ValidationMessage = "TPM protector exists but no TPM hardware found"
+                            $protectorResults.InvalidProtectors++
+                            Write-DiagnosticMessage "TPM protector: INVALID (No TPM hardware)" -Type "Error"
+                        }
+                    }
+                    "ExternalKey" {
+                        Write-DiagnosticMessage "External Key protector: Present" -Type "Info"
+                        $volumeProtectorInfo.ValidProtectorCount++
+                        $protectorResults.ValidProtectors++
+                    }
+                    "TpmPin" {
+                        Write-DiagnosticMessage "TPM+PIN protector: Present" -Type "Info"
+                        $volumeProtectorInfo.ValidProtectorCount++
+                        $protectorResults.ValidProtectors++
+                    }
+                    default {
+                        Write-DiagnosticMessage "$($protector.KeyProtectorType) protector: Present" -Type "Info"
+                        $volumeProtectorInfo.ValidProtectorCount++
+                        $protectorResults.ValidProtectors++
+                    }
+                }
+                
+                $volumeProtectorInfo.Protectors += $protectorDetail
+            }
+            
+            # Validate minimum protector requirements
+            if ($volumeProtectorInfo.ProtectorCount -eq 0) {
+                $volumeProtectorInfo.Issues += "No key protectors found"
+                $protectorResults.Issues += "Volume $($volume.MountPoint) has no key protectors"
+                Write-DiagnosticMessage "Volume $($volume.MountPoint): NO KEY PROTECTORS" -Type "Critical"
+            } elseif ($volumeProtectorInfo.ValidProtectorCount -eq 0) {
+                $volumeProtectorInfo.Issues += "No valid key protectors found"
+                $protectorResults.Issues += "Volume $($volume.MountPoint) has no valid key protectors"
+                Write-DiagnosticMessage "Volume $($volume.MountPoint): NO VALID PROTECTORS" -Type "Critical"
+            }
+            
+            $protectorResults.VolumeProtectors += $volumeProtectorInfo
+        }
+        
+        Write-DiagnosticMessage "Protector Summary: $($protectorResults.ValidProtectors) valid, $($protectorResults.InvalidProtectors) invalid" -Type "Info"
+        
+        return $protectorResults
+    }
+    catch {
+        $protectorResults.Issues += "Failed to enumerate key protectors: $($_.Exception.Message)"
+        Write-DiagnosticMessage "Failed to check key protectors: $($_.Exception.Message)" -Type "Error"
+        return $protectorResults
+    }
+}
+
+# Generate comprehensive recommendations
+function Get-BitLockerRecommendations {
+    param($DiagnosticResults)
+    
+    $recommendations = @()
+    
+    # Volume Status Recommendations
+    if ($DiagnosticResults.VolumeStatus.UnencryptedVolumes -gt 0) {
+        $recommendations += "Enable BitLocker encryption on unencrypted volumes"
+        $recommendations += "Use 'manage-bde -on C:' or Enable-BitLocker PowerShell cmdlet"
+    }
+    
+    if ($DiagnosticResults.VolumeStatus.PartiallyEncryptedVolumes -gt 0) {
+        $recommendations += "Allow encryption/decryption operations to complete"
+        $recommendations += "Avoid interrupting the encryption process"
+    }
+    
+    # TPM Recommendations
+    if ($DiagnosticResults.TPMStatus.Issues.Count -gt 0) {
+        if (-not $DiagnosticResults.TPMStatus.TPMPresent) {
+            $recommendations += "Install TPM hardware or use BitLocker without TPM (less secure)"
+            $recommendations += "Configure Group Policy to 'Allow BitLocker without a compatible TPM'"
+        }
+        
+        if ($DiagnosticResults.TPMStatus.TPMPresent -and -not $DiagnosticResults.TPMStatus.IsEnabled) {
+            $recommendations += "Enable TPM in BIOS/UEFI settings"
+            $recommendations += "Restart system and access firmware setup during boot"
+        }
+        
+        if ($DiagnosticResults.TPMStatus.TPMPresent -and -not $DiagnosticResults.TPMStatus.IsOwned) {
+            $recommendations += "Initialize TPM using 'Initialize-Tpm' PowerShell cmdlet"
+            $recommendations += "Or run 'tpm.msc' and initialize TPM through management console"
+        }
+    }
+    
+    # Group Policy Recommendations
+    if ($DiagnosticResults.GroupPolicySettings.ConflictingSettings.Count -gt 0) {
+        $recommendations += "Review and resolve conflicting Group Policy settings"
+        $recommendations += "Check with domain administrator for BitLocker policy requirements"
+    }
+    
+    # Recovery Key Recommendations
+    if ($DiagnosticResults.RecoveryKeyStatus.MissingKeys.Count -gt 0) {
+        $recommendations += "Add recovery password protectors to volumes missing them"
+        $recommendations += "Use 'Add-BitLockerKeyProtector -MountPoint C: -RecoveryPasswordProtector'"
+        $recommendations += "Backup recovery keys to Active Directory or secure location"
+    }
+    
+    # Service Recommendations
+    if ($DiagnosticResults.ServiceStatus.StoppedServices -gt 0) {
+        $recommendations += "Start stopped BitLocker-related services"
+        $recommendations += "Set BDESVC service to Automatic startup type"
+        $recommendations += "Use 'Start-Service BDESVC' and 'Set-Service BDESVC -StartupType Automatic'"
+    }
+    
+    # Event Log Recommendations
+    if ($DiagnosticResults.EventLogAnalysis.CriticalErrors -gt 0) {
+        $recommendations += "Investigate critical errors in BitLocker event logs"
+        $recommendations += "Review System and Application logs for related errors"
+        $recommendations += "Check Microsoft documentation for specific Event IDs found"
+    }
+    
+    # Key Protector Recommendations
+    if ($DiagnosticResults.KeyProtectorStatus.InvalidProtectors -gt 0) {
+        $recommendations += "Remove invalid key protectors and add new ones"
+        $recommendations += "Verify TPM hardware functionality if TPM protectors are invalid"
+        $recommendations += "Re-create recovery passwords for corrupted protectors"
+    }
+    
+    return $recommendations
+}
+
+# Main execution function
+function Start-BitLockerDiagnostics {
+    Write-Host "`n=== BitLocker Diagnostic Tool ===" -ForegroundColor Cyan
+    Write-Host "Performing comprehensive BitLocker analysis...`n" -ForegroundColor Cyan
+    
+    if (-not (Test-IsAdministrator)) {
+        Write-DiagnosticMessage "This script requires administrator privileges. Please run as administrator." -Type "Critical"
+        exit 1
+    }
+    
+    # Execute all diagnostic steps
+    Write-Host "`nExecuting diagnostic steps..." -ForegroundColor Yellow
+    
+    $BitLockerDiagnostics.VolumeStatus = Test-BitLockerVolumeStatus
+    $BitLockerDiagnostics.TPMStatus = Test-TPMStatus  
+    $BitLockerDiagnostics.GroupPolicySettings = Test-GroupPolicySettings
+    $BitLockerDiagnostics.RecoveryKeyStatus = Test-RecoveryKeyStatus
+    $BitLockerDiagnostics.ServiceStatus = Test-BitLockerServices
+    $BitLockerDiagnostics.EventLogAnalysis = Test-BitLockerEventLogs
+    $BitLockerDiagnostics.KeyProtectorStatus = Test-KeyProtectorIntegrity
+    
+    # Generate recommendations
+    $BitLockerDiagnostics.Recommendations = Get-BitLockerRecommendations -DiagnosticResults $BitLockerDiagnostics
+    
+    # Collect critical issues and warnings
+    $criticalCount = 0
+    $warningCount = 0
+    
+    # Count critical issues
+    if ($BitLockerDiagnostics.VolumeStatus.Issues.Count -gt 0) {
+        $BitLockerDiagnostics.CriticalIssues += $BitLockerDiagnostics.VolumeStatus.Issues
+        $criticalCount += $BitLockerDiagnostics.VolumeStatus.Issues.Count
+    }
+    
+    if ($BitLockerDiagnostics.TPMStatus.Issues.Count -gt 0) {
+        $BitLockerDiagnostics.CriticalIssues += $BitLockerDiagnostics.TPMStatus.Issues
+        $criticalCount += $BitLockerDiagnostics.TPMStatus.Issues.Count
+    }
+    
+    if ($BitLockerDiagnostics.RecoveryKeyStatus.Issues.Count -gt 0) {
+        $BitLockerDiagnostics.CriticalIssues += $BitLockerDiagnostics.RecoveryKeyStatus.Issues
+        $criticalCount += $BitLockerDiagnostics.RecoveryKeyStatus.Issues.Count
+    }
+    
+    if ($BitLockerDiagnostics.ServiceStatus.Issues.Count -gt 0) {
+        $BitLockerDiagnostics.CriticalIssues += $BitLockerDiagnostics.ServiceStatus.Issues
+        $criticalCount += $BitLockerDiagnostics.ServiceStatus.Issues.Count
+    }
+    
+    if ($BitLockerDiagnostics.KeyProtectorStatus.Issues.Count -gt 0) {
+        $BitLockerDiagnostics.CriticalIssues += $BitLockerDiagnostics.KeyProtectorStatus.Issues
+        $criticalCount += $BitLockerDiagnostics.KeyProtectorStatus.Issues.Count
+    }
+    
+    # Count warnings
+    if ($BitLockerDiagnostics.GroupPolicySettings.ConflictingSettings.Count -gt 0) {
+        $BitLockerDiagnostics.Warnings += $BitLockerDiagnostics.GroupPolicySettings.ConflictingSettings
+        $warningCount += $BitLockerDiagnostics.GroupPolicySettings.ConflictingSettings.Count
+    }
+    
+    if ($BitLockerDiagnostics.EventLogAnalysis.Warnings -gt 0) {
+        $warningCount += $BitLockerDiagnostics.EventLogAnalysis.Warnings
+    }
+    
+    # Determine overall status
+    if ($criticalCount -eq 0 -and $warningCount -eq 0) {
+        $BitLockerDiagnostics.OverallStatus = "Healthy"
+    } elseif ($criticalCount -eq 0 -and $warningCount -gt 0) {
+        $BitLockerDiagnostics.OverallStatus = "Warning - Minor Issues"
+    } elseif ($criticalCount -le 2) {
+        $BitLockerDiagnostics.OverallStatus = "Issues Detected"
+    } else {
+        $BitLockerDiagnostics.OverallStatus = "Critical Issues"
+    }
+    
+    # Display comprehensive summary
+    Write-Host "`n" + "="*60 -ForegroundColor Cyan
+    Write-Host "BITLOCKER DIAGNOSTIC SUMMARY" -ForegroundColor Cyan
+    Write-Host "="*60 -ForegroundColor Cyan
+    
+    Write-Host "`nOverall Status: " -NoNewline
+    switch ($BitLockerDiagnostics.OverallStatus) {
+        "Healthy" { Write-Host $BitLockerDiagnostics.OverallStatus -ForegroundColor Green }
+        "Warning - Minor Issues" { Write-Host $BitLockerDiagnostics.OverallStatus -ForegroundColor Yellow }
+        "Issues Detected" { Write-Host $BitLockerDiagnostics.OverallStatus -ForegroundColor Red }
+        "Critical Issues" { Write-Host $BitLockerDiagnostics.OverallStatus -ForegroundColor Magenta }
+    }
+    
+    Write-Host "`nSYSTEM OVERVIEW:" -ForegroundColor Cyan
+    Write-Host "Computer Name: $($BitLockerDiagnostics.ComputerName)"
+    Write-Host "Scan Time: $($BitLockerDiagnostics.Timestamp)"
+    
+    Write-Host "`nVOLUME STATUS:" -ForegroundColor Cyan
+    Write-Host "• Total Volumes: $($BitLockerDiagnostics.VolumeStatus.TotalVolumes)"
+    Write-Host "• Encrypted: " -NoNewline -ForegroundColor Green
+    Write-Host $BitLockerDiagnostics.VolumeStatus.EncryptedVolumes
+    Write-Host "• Unencrypted: " -NoNewline -ForegroundColor $(if($BitLockerDiagnostics.VolumeStatus.UnencryptedVolumes -gt 0) {"Red"} else {"Green"})
+    Write-Host $BitLockerDiagnostics.VolumeStatus.UnencryptedVolumes
+    Write-Host "• Partially Encrypted: " -NoNewline -ForegroundColor $(if($BitLockerDiagnostics.VolumeStatus.PartiallyEncryptedVolumes -gt 0) {"Yellow"} else {"Green"})
+    Write-Host $BitLockerDiagnostics.VolumeStatus.PartiallyEncryptedVolumes
+    
+    Write-Host "`nTPM STATUS:" -ForegroundColor Cyan
+    Write-Host "• TPM Present: " -NoNewline
+    Write-Host $BitLockerDiagnostics.TPMStatus.TPMPresent -ForegroundColor $(if($BitLockerDiagnostics.TPMStatus.TPMPresent) {"Green"} else {"Red"})
+    Write-Host "• TPM Activated: " -NoNewline  
+    Write-Host $BitLockerDiagnostics.TPMStatus.IsActivated -ForegroundColor $(if($BitLockerDiagnostics.TPMStatus.IsActivated) {"Green"} else {"Red"})
+    Write-Host "• TPM Enabled: " -NoNewline
+    Write-Host $BitLockerDiagnostics.TPMStatus.IsEnabled -ForegroundColor $(if($BitLockerDiagnostics.TPMStatus.IsEnabled) {"Green"} else {"Red"})
+    
+    Write-Host "`nSERVICE STATUS:" -ForegroundColor Cyan
+    Write-Host "• Services Running: $($BitLockerDiagnostics.ServiceStatus.RunningServices)/$($BitLockerDiagnostics.ServiceStatus.ServicesChecked)" -ForegroundColor $(if($BitLockerDiagnostics.ServiceStatus.RunningServices -eq $BitLockerDiagnostics.ServiceStatus.ServicesChecked) {"Green"} else {"Red"}) 
+    
+    Write-Host "`nKEY PROTECTORS:" -ForegroundColor Cyan
+    Write-Host "• Total Protectors: $($BitLockerDiagnostics.KeyProtectorStatus.TotalProtectors)"
+    Write-Host "• Valid Protectors: " -NoNewline -ForegroundColor Green
+    Write-Host $BitLockerDiagnostics.KeyProtectorStatus.ValidProtectors
+    Write-Host "• Invalid Protectors: " -NoNewline -ForegroundColor $(if($BitLockerDiagnostics.KeyProtectorStatus.InvalidProtectors -gt 0) {"Red"} else {"Green"})
+    Write-Host $BitLockerDiagnostics.KeyProtectorStatus.InvalidProtectors
+    
+    Write-Host "`nRECOVERY KEYS:" -ForegroundColor Cyan  
+    Write-Host "• Recovery Keys Available: $($BitLockerDiagnostics.RecoveryKeyStatus.TotalRecoveryKeys)"
+    Write-Host "• Volumes Missing Recovery Keys: " -NoNewline -ForegroundColor $(if($BitLockerDiagnostics.RecoveryKeyStatus.MissingKeys.Count -gt 0) {"Red"} else {"Green"})
+    Write-Host $BitLockerDiagnostics.RecoveryKeyStatus.MissingKeys.Count
+    
+    # Display critical issues
+    if ($BitLockerDiagnostics.CriticalIssues.Count -gt 0) {
+        Write-Host "`nCRITICAL ISSUES:" -ForegroundColor Red
+        foreach ($issue in $BitLockerDiagnostics.CriticalIssues) {
+            Write-Host "• $issue" -ForegroundColor Red
+        }
+    }
+    
+    # Display warnings
+    if ($BitLockerDiagnostics.Warnings.Count -gt 0) {
+        Write-Host "`nWARNINGS:" -ForegroundColor Yellow
+        foreach ($warning in $BitLockerDiagnostics.Warnings) {
+            Write-Host "• $warning" -ForegroundColor Yellow
+        }
+    }
+    
+    # Display recommendations
+    if ($BitLockerDiagnostics.Recommendations.Count -gt 0) {
+        Write-Host "`nRECOMMENDATIONS:" -ForegroundColor Cyan
+        for ($i = 0; $i -lt $BitLockerDiagnostics.Recommendations.Count; $i++) {
+            Write-Host "$($i + 1). $($BitLockerDiagnostics.Recommendations[$i])" -ForegroundColor Yellow
+        }
+    }
+    
+    # Export results if requested
+    if ($ExportResults) {
+        $exportPath = "BitLockerDiagnostics_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+        $BitLockerDiagnostics | ConvertTo-Json -Depth 10 | Out-File -FilePath $exportPath -Encoding UTF8
+        Write-DiagnosticMessage "Detailed results exported to: $exportPath" -Type "Success"
+    }
+    
+    # Show detailed results if requested
+    if ($Detailed) {
+        Write-Host "`n" + "="*60 -ForegroundColor Cyan
+        Write-Host "DETAILED DIAGNOSTIC RESULTS" -ForegroundColor Cyan  
+        Write-Host "="*60 -ForegroundColor Cyan
+        
+        Write-Host "`nVolume Details:" -ForegroundColor Yellow
+        foreach ($volume in $BitLockerDiagnostics.VolumeStatus.Volumes) {
+            Write-Host "  Volume: $($volume.MountPoint)" -ForegroundColor White
+            Write-Host "    Type: $($volume.VolumeType)"
+            Write-Host "    Protection: $($volume.ProtectionStatus)"
+            Write-Host "    Encryption: $($volume.EncryptionMethod)"
+            Write-Host "    Progress: $($volume.EncryptionPercentage)%"
+            Write-Host "    Key Protectors: $($volume.KeyProtectorCount)"
+            Write-Host ""
+        }
+        
+        if ($BitLockerDiagnostics.GroupPolicySettings.PolicyKeysFound -gt 0) {
+            Write-Host "`nActive Group Policies:" -ForegroundColor Yellow
+            foreach ($policy in $BitLockerDiagnostics.GroupPolicySettings.ActivePolicies.GetEnumerator()) {
+                Write-Host "  $($policy.Key): $($policy.Value)" -ForegroundColor White
+            }
+        }
+        
+        if ($BitLockerDiagnostics.EventLogAnalysis.RecentEvents.Count -gt 0) {
+            Write-Host "`nRecent BitLocker Events (Last 7 Days):" -ForegroundColor Yellow
+            $BitLockerDiagnostics.EventLogAnalysis.RecentEvents | 
+                Sort-Object TimeCreated -Descending | 
+                Select-Object -First 10 | 
+                ForEach-Object {
+                    Write-Host "  [$($_.Level)] Event $($_.EventID) - $($_.TimeCreated)" -ForegroundColor White
+                    Write-Host "    $($_.Message.Substring(0, [Math]::Min(100, $_.Message.Length)))..." -ForegroundColor Gray
+                }
+        }
+    }
+    
+    Write-Host "`n" + "="*60 -ForegroundColor Cyan
+    Write-Host "Diagnostic completed. Use -Detailed for verbose output or -ExportResults to save detailed results." -ForegroundColor Cyan
+    Write-Host "="*60 -ForegroundColor Cyan
+    
+    return $BitLockerDiagnostics
+}
+
+# Execute the diagnostics
+Write-Host "Initializing BitLocker Diagnostic Tool..." -ForegroundColor Green
+$Results = Start-BitLockerDiagnostics
