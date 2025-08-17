@@ -1,0 +1,741 @@
+#Requires -RunAsAdministrator
+
+<#
+.SYNOPSIS
+    Systematically parses firewall log files and reports back statistics.
+    Can be used to do forensic analysis confirmations
+
+.DESCRIPTION
+    This script performs FireWall analysis including:
+    - FIREWALL LOG VALIDATION
+    - PARSING FIREWALL LOG
+    - PARALLEL PROCESSING (Fast af boii)
+    - FILTERING DROPPED PACKETS
+    - DROPPED PACKETS DETAILS
+    - SUMMARY STATISTICS
+    - SECURITY INSIGHTS
+
+.NOTES
+    Author: Stefan T.
+    Requires: Administrator privileges
+    Version: 1.0
+    
+.PARAMETER ExportResults
+    Export detailed results to JSON file
+    
+.PARAMETER Detailed
+    Show detailed diagnostic information
+    
+.PARAMETER CheckADBackup
+    Verify Active Directory backup of recovery keys
+#>
+
+
+
+param(
+    [string]$LogPath = "C:\Windows\System32\LogFiles\Firewall\pfirewall.log",
+    [int]$LastHours = 0,  # 0 = all time, otherwise filter to last N hours
+    [string]$ExportPath = "",  # Optional CSV export path
+    [switch]$ShowTop10Only,
+    [switch]$Verbose,
+    [int]$MaxThreads = [Math]::Min([Environment]::ProcessorCount, 4),  # Cap at 4 for stability
+    [switch]$DisableParallel  # Fallback to sequential processing
+)
+
+# Function to write colored output with error handling
+function Write-ColorOutput {
+    param([string]$Text, [string]$Color = "White")
+    try {
+        Write-Host $Text -ForegroundColor $Color
+    } catch {
+        Write-Host $Text
+    }
+}
+
+# Function to validate log file existence and suggest alternatives
+function Test-FirewallLogFile {
+    param([string]$Path)
+   
+    Write-ColorOutput "=== FIREWALL LOG VALIDATION ===" "Cyan"
+   
+    if (-not (Test-Path $Path)) {
+        Write-ColorOutput "ERROR: Firewall log file not found at: $Path" "Red"
+        
+        Write-ColorOutput "`nSearching for alternative firewall log files..." "Yellow"
+        $commonPaths = @(
+            "C:\Windows\System32\LogFiles\Firewall\pfirewall.log",
+            "C:\Windows\System32\LogFiles\Firewall\domainfw.log",
+            "C:\Windows\System32\LogFiles\Firewall\privatefw.log",
+            "C:\Windows\System32\LogFiles\Firewall\publicfw.log"
+        )
+        
+        $foundLogs = @()
+        foreach ($logPath in $commonPaths) {
+            if (Test-Path $logPath) {
+                $logInfo = Get-Item $logPath
+                $foundLogs += [PSCustomObject]@{
+                    Path = $logPath
+                    Size = [math]::Round($logInfo.Length / 1MB, 2)
+                    LastModified = $logInfo.LastWriteTime
+                }
+            }
+        }
+        
+        if ($foundLogs.Count -gt 0) {
+            Write-ColorOutput "✓ Found alternative firewall log files:" "Green"
+            $foundLogs | Format-Table -Property Path, @{Name="Size(MB)"; Expression={$_.Size}}, LastModified -AutoSize
+            Write-ColorOutput "Try running with one of these paths using -LogPath parameter" "Yellow"
+        } else {
+            Write-ColorOutput "No firewall log files found in standard locations." "Red"
+            Write-ColorOutput "`nTo enable Windows Firewall logging:" "Yellow"
+            Write-ColorOutput "1. Open Windows Defender Firewall with Advanced Security" "Yellow"
+            Write-ColorOutput "2. Right-click 'Windows Defender Firewall with Advanced Security'" "Yellow"
+            Write-ColorOutput "3. Select 'Properties'" "Yellow"
+            Write-ColorOutput "4. For each profile (Domain, Private, Public):" "Yellow"
+            Write-ColorOutput "   - Click 'Customize' under Logging" "Yellow"
+            Write-ColorOutput "   - Set 'Log dropped packets' to 'Yes'" "Yellow"
+            Write-ColorOutput "   - Note the log file path" "Yellow"
+        }
+        
+        return $false
+    }
+   
+    $fileInfo = Get-Item $Path
+    Write-ColorOutput "✓ Log file found: $Path" "Green"
+    Write-ColorOutput "  File size: $([math]::Round($fileInfo.Length / 1MB, 2)) MB" "Gray"
+    Write-ColorOutput "  Last modified: $($fileInfo.LastWriteTime)" "Gray"
+    
+    # Check if file is locked
+    try {
+        $testStream = [System.IO.FileStream]::new($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $testStream.Close()
+        $testStream.Dispose()
+        Write-ColorOutput "  File access: Available for reading" "Green"
+    }
+    catch {
+        Write-ColorOutput "  File access: File appears to be locked (Windows Firewall service active)" "Yellow"
+        Write-ColorOutput "  Will attempt multiple reading methods..." "Yellow"
+    }
+    
+    # Check if file is too large for parallel processing
+    if ($fileInfo.Length -gt 500MB) {
+        Write-ColorOutput "  WARNING: Large file detected. Consider using -DisableParallel for stability." "Yellow"
+    }
+    
+    # Check if file is empty or very small
+    if ($fileInfo.Length -eq 0) {
+        Write-ColorOutput "  WARNING: Log file is empty. Check if firewall logging is enabled." "Yellow"
+    } elseif ($fileInfo.Length -lt 1KB) {
+        Write-ColorOutput "  WARNING: Log file is very small. May contain limited data." "Yellow"
+    }
+    
+    return $true
+}
+
+# Safe file reading function with locked file handling
+function Get-FileContentSafe {
+    param([string]$LogPath)
+    
+    Write-ColorOutput "✓ Reading log file safely..." "Green"
+    
+    # Method 1: Try Get-Content with ReadOnly access
+    try {
+        Write-ColorOutput "  Attempting method 1: Get-Content with ReadOnly..." "Gray"
+        $content = Get-Content -LiteralPath $LogPath -ErrorAction Stop
+        Write-ColorOutput "✓ Successfully read $($content.Count) lines using Get-Content" "Green"
+        return $content
+    }
+    catch {
+        Write-ColorOutput "  Method 1 failed: $($_.Exception.Message)" "Yellow"
+    }
+    
+    # Method 2: Try StreamReader with FileShare.ReadWrite
+    try {
+        Write-ColorOutput "  Attempting method 2: StreamReader with shared access..." "Gray"
+        $fileStream = [System.IO.FileStream]::new($LogPath, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::ReadWrite)
+        $reader = [System.IO.StreamReader]::new($fileStream)
+        
+        $content = @()
+        while ($null -ne ($line = $reader.ReadLine())) {
+            $content += $line
+        }
+        
+        $reader.Close()
+        $reader.Dispose()
+        $fileStream.Close()
+        $fileStream.Dispose()
+        
+        Write-ColorOutput "✓ Successfully read $($content.Count) lines using shared access" "Green"
+        return $content
+    }
+    catch {
+        Write-ColorOutput "  Method 2 failed: $($_.Exception.Message)" "Yellow"
+    }
+    
+    # Method 3: Try copying file first
+    try {
+        Write-ColorOutput "  Attempting method 3: Copy file to temp location..." "Gray"
+        $tempFile = [System.IO.Path]::GetTempFileName()
+        $tempLogFile = $tempFile + ".log"
+        
+        # Use robocopy for locked files
+        $robocopyResult = & robocopy (Split-Path $LogPath -Parent) (Split-Path $tempLogFile -Parent) (Split-Path $LogPath -Leaf) /copy:DT /r:1 /w:1 2>$null
+        
+        if (Test-Path $tempLogFile) {
+            Write-ColorOutput "  File copied successfully, reading from temp location..." "Gray"
+            $content = Get-Content -LiteralPath $tempLogFile -ErrorAction Stop
+            Remove-Item $tempLogFile -Force -ErrorAction SilentlyContinue
+            Remove-Item $tempFile -Force -ErrorAction SilentlyContinue
+            Write-ColorOutput "✓ Successfully read $($content.Count) lines from copied file" "Green"
+            return $content
+        }
+    }
+    catch {
+        Write-ColorOutput "  Method 3 failed: $($_.Exception.Message)" "Yellow"
+    }
+    
+    # Method 4: Try PowerShell's file reading with different approaches
+    try {
+        Write-ColorOutput "  Attempting method 4: Alternative PowerShell method..." "Gray"
+        $content = [System.IO.File]::ReadAllLines($LogPath)
+        Write-ColorOutput "✓ Successfully read $($content.Count) lines using ReadAllLines" "Green"
+        return $content
+    }
+    catch {
+        Write-ColorOutput "  Method 4 failed: $($_.Exception.Message)" "Yellow"
+    }
+    
+    # Method 5: Try using WMI/CIM to read file
+    try {
+        Write-ColorOutput "  Attempting method 5: Using type command..." "Gray"
+        $content = & cmd.exe /c "type `"$LogPath`"" 2>$null | Where-Object { $_ }
+        if ($content -and $content.Count -gt 0) {
+            Write-ColorOutput "✓ Successfully read $($content.Count) lines using type command" "Green"
+            return $content
+        }
+    }
+    catch {
+        Write-ColorOutput "  Method 5 failed: $($_.Exception.Message)" "Yellow"
+    }
+    
+    Write-ColorOutput "ERROR: All file reading methods failed. The log file may be locked by Windows Firewall service." "Red"
+    Write-ColorOutput "SOLUTIONS:" "Yellow"
+    Write-ColorOutput "  1. Stop Windows Firewall service temporarily:" "Yellow"
+    Write-ColorOutput "     net stop mpssvc" "Gray"
+    Write-ColorOutput "     (Run script, then: net start mpssvc)" "Gray"
+    Write-ColorOutput "  2. Copy the file to another location manually" "Yellow"
+    Write-ColorOutput "  3. Run script as Administrator" "Yellow"
+    Write-ColorOutput "  4. Try a different log file location:" "Yellow"
+    Write-ColorOutput "     -LogPath 'C:\Windows\System32\LogFiles\Firewall\domainfw.log'" "Gray"
+    Write-ColorOutput "     -LogPath 'C:\Windows\System32\LogFiles\Firewall\privatefw.log'" "Gray"
+    Write-ColorOutput "     -LogPath 'C:\Windows\System32\LogFiles\Firewall\publicfw.log'" "Gray"
+    
+    return $null
+}
+
+# Optimized sequential parsing (fallback and small files)
+function Parse-FirewallLogSequential {
+    param([string]$LogPath, [int]$LastHours)
+   
+    Write-ColorOutput "`n=== PARSING FIREWALL LOG (SEQUENTIAL) ===" "Cyan"
+    
+    $content = Get-FileContentSafe -LogPath $LogPath
+    if (-not $content) {
+        return @()
+    }
+    
+    # Find header
+    $headerLine = $content | Where-Object { $_ -match "^#Fields:" } | Select-Object -First 1
+    
+    if (-not $headerLine) {
+        Write-ColorOutput "WARNING: No header line found. Using default field mapping." "Yellow"
+        $fieldNames = @("date", "time", "action", "protocol", "src-ip", "dst-ip", "src-port", "dst-port", "size", "tcpflags", "tcpsyn", "tcpack", "tcpwin", "icmptype", "icmpcode", "info", "path")
+    } else {
+        $fieldNames = ($headerLine -replace "^#Fields: ", "") -split "\s+"
+        Write-ColorOutput "✓ Found header with fields: $($fieldNames -join ', ')" "Green"
+    }
+    
+    # Calculate cutoff time
+    $cutoffTime = if ($LastHours -gt 0) { (Get-Date).AddHours(-$LastHours) } else { $null }
+    
+    # Parse entries
+    $parsedEntries = @()
+    $parseErrors = 0
+    $dataLines = $content | Where-Object { $_ -notmatch "^#" -and $_.Trim() -ne "" }
+    
+    Write-ColorOutput "✓ Processing $($dataLines.Count) data lines..." "Green"
+    
+    $counter = 0
+    foreach ($line in $dataLines) {
+        $counter++
+        if ($counter % 10000 -eq 0) {
+            Write-ColorOutput "  Processed $counter lines..." "Gray"
+        }
+        
+        try {
+            $fields = $line -split "\s+"
+            $entry = New-Object PSObject
+            
+            # Map fields
+            for ($i = 0; $i -lt [math]::Min($fields.Count, $fieldNames.Count); $i++) {
+                $entry | Add-Member -NotePropertyName $fieldNames[$i] -NotePropertyValue $fields[$i]
+            }
+            
+            # Parse datetime
+            if ($entry.date -and $entry.time) {
+                try {
+                    $entry | Add-Member -NotePropertyName "DateTime" -NotePropertyValue ([datetime]::ParseExact("$($entry.date) $($entry.time)", "yyyy-MM-dd HH:mm:ss", $null))
+                } catch {
+                    try {
+                        $entry | Add-Member -NotePropertyName "DateTime" -NotePropertyValue ([datetime]::Parse("$($entry.date) $($entry.time)"))
+                    } catch {
+                        $entry | Add-Member -NotePropertyName "DateTime" -NotePropertyValue $null
+                    }
+                }
+            }
+            
+            # Apply time filter
+            if ($LastHours -gt 0 -and $cutoffTime) {
+                if ($entry.DateTime -and $entry.DateTime -lt $cutoffTime) {
+                    continue
+                }
+            }
+            
+            $parsedEntries += $entry
+        } catch {
+            $parseErrors++
+            if ($Verbose) {
+                Write-ColorOutput "Parse error on line: $line" "Red"
+            }
+        }
+    }
+    
+    if ($parseErrors -gt 0) {
+        Write-ColorOutput "WARNING: $parseErrors lines could not be parsed" "Yellow"
+    }
+    
+    Write-ColorOutput "✓ Sequential parsing complete: $($parsedEntries.Count) entries" "Green"
+    return $parsedEntries
+}
+
+# Safer parallel parsing with better error handling
+function Parse-FirewallLogParallel {
+    param([string]$LogPath, [int]$LastHours, [int]$MaxThreads)
+   
+    Write-ColorOutput "`n=== PARSING FIREWALL LOG (PARALLEL - SAFE MODE) ===" "Cyan"
+    
+    try {
+        $content = Get-FileContentSafe -LogPath $LogPath
+        if (-not $content) {
+            Write-ColorOutput "Falling back to sequential processing..." "Yellow"
+            return Parse-FirewallLogSequential -LogPath $LogPath -LastHours $LastHours
+        }
+        
+        # For small files, use sequential
+        if ($content.Count -lt 5000) {
+            Write-ColorOutput "Small file detected, using sequential processing for efficiency" "Yellow"
+            return Parse-FirewallLogSequential -LogPath $LogPath -LastHours $LastHours
+        }
+        
+        # Find header
+        $headerLine = $content | Where-Object { $_ -match "^#Fields:" } | Select-Object -First 1
+        
+        if (-not $headerLine) {
+            $fieldNames = @("date", "time", "action", "protocol", "src-ip", "dst-ip", "src-port", "dst-port", "size", "tcpflags", "tcpsyn", "tcpack", "tcpwin", "icmptype", "icmpcode", "info", "path")
+        } else {
+            $fieldNames = ($headerLine -replace "^#Fields: ", "") -split "\s+"
+        }
+        
+        $cutoffTime = if ($LastHours -gt 0) { (Get-Date).AddHours(-$LastHours) } else { $null }
+        
+        # Create smaller, safer chunks
+        $dataLines = $content | Where-Object { $_ -notmatch "^#" -and $_.Trim() -ne "" }
+        $chunkSize = [Math]::Max(1000, [Math]::Ceiling($dataLines.Count / $MaxThreads))
+        $chunks = @()
+        
+        for ($i = 0; $i -lt $dataLines.Count; $i += $chunkSize) {
+            $endIndex = [Math]::Min($i + $chunkSize - 1, $dataLines.Count - 1)
+            $chunks += ,@($dataLines[$i..$endIndex])
+        }
+        
+        Write-ColorOutput "✓ Created $($chunks.Count) chunks with max $chunkSize lines each" "Green"
+        
+        # Safer runspace creation
+        $runspacePool = $null
+        $jobs = @()
+        
+        try {
+            $runspacePool = [runspacefactory]::CreateRunspacePool(1, $MaxThreads)
+            $runspacePool.ApartmentState = "MTA"
+            $runspacePool.Open()
+            
+            # Simpler scriptblock
+            $parseScript = {
+                param($Lines, $Fields, $Hours, $Cutoff)
+                
+                $results = @()
+                foreach ($line in $Lines) {
+                    try {
+                        $parts = $line -split "\s+"
+                        $obj = New-Object PSObject
+                        
+                        for ($i = 0; $i -lt [math]::Min($parts.Count, $Fields.Count); $i++) {
+                            $obj | Add-Member -NotePropertyName $Fields[$i] -NotePropertyValue $parts[$i]
+                        }
+                        
+                        if ($obj.date -and $obj.time) {
+                            try {
+                                $obj | Add-Member -NotePropertyName "DateTime" -NotePropertyValue ([datetime]::ParseExact("$($obj.date) $($obj.time)", "yyyy-MM-dd HH:mm:ss", $null))
+                            } catch {
+                                $obj | Add-Member -NotePropertyName "DateTime" -NotePropertyValue $null
+                            }
+                        }
+                        
+                        if ($Hours -gt 0 -and $Cutoff -and $obj.DateTime -and $obj.DateTime -lt $Cutoff) {
+                            continue
+                        }
+                        
+                        $results += $obj
+                    } catch {
+                        # Skip problematic lines
+                    }
+                }
+                return $results
+            }
+            
+            # Create jobs
+            foreach ($chunk in $chunks) {
+                $powershell = [powershell]::Create()
+                $powershell.RunspacePool = $runspacePool
+                
+                [void]$powershell.AddScript($parseScript)
+                [void]$powershell.AddParameter("Lines", $chunk)
+                [void]$powershell.AddParameter("Fields", $fieldNames)
+                [void]$powershell.AddParameter("Hours", $LastHours)
+                [void]$powershell.AddParameter("Cutoff", $cutoffTime)
+                
+                $jobs += @{
+                    PowerShell = $powershell
+                    Handle = $powershell.BeginInvoke()
+                }
+            }
+            
+            Write-ColorOutput "✓ Started $($jobs.Count) parsing jobs" "Green"
+            
+            # Collect results with timeout
+            $allResults = @()
+            $timeout = 300 # 5 minutes timeout
+            $startTime = Get-Date
+            
+            foreach ($job in $jobs) {
+                try {
+                    $elapsed = ((Get-Date) - $startTime).TotalSeconds
+                    if ($elapsed -gt $timeout) {
+                        Write-ColorOutput "WARNING: Timeout reached, switching to sequential mode" "Yellow"
+                        break
+                    }
+                    
+                    # Wait for completion with timeout
+                    while (-not $job.Handle.IsCompleted) {
+                        Start-Sleep -Milliseconds 100
+                        if (((Get-Date) - $startTime).TotalSeconds -gt $timeout) {
+                            break
+                        }
+                    }
+                    
+                    if ($job.Handle.IsCompleted) {
+                        $result = $job.PowerShell.EndInvoke($job.Handle)
+                        $allResults += $result
+                    }
+                }
+                catch {
+                    Write-ColorOutput "Warning: Job failed, continuing with remaining jobs" "Yellow"
+                }
+                finally {
+                    if ($job.PowerShell) {
+                        $job.PowerShell.Dispose()
+                    }
+                }
+            }
+            
+            Write-ColorOutput "✓ Parallel parsing complete: $($allResults.Count) entries" "Green"
+            return $allResults
+        }
+        catch {
+            Write-ColorOutput "ERROR in parallel processing: $($_.Exception.Message)" "Red"
+            Write-ColorOutput "Falling back to sequential processing..." "Yellow"
+            return Parse-FirewallLogSequential -LogPath $LogPath -LastHours $LastHours
+        }
+        finally {
+            # Cleanup
+            if ($runspacePool) {
+                try {
+                    $runspacePool.Close()
+                    $runspacePool.Dispose()
+                } catch {
+                    # Ignore cleanup errors
+                }
+            }
+        }
+    }
+    catch {
+        Write-ColorOutput "ERROR: Parallel processing failed: $($_.Exception.Message)" "Red"
+        Write-ColorOutput "Falling back to sequential processing..." "Yellow"
+        return Parse-FirewallLogSequential -LogPath $LogPath -LastHours $LastHours
+    }
+}
+
+# Simple and efficient filtering
+function Get-DroppedPackets {
+    param([array]$LogEntries)
+   
+    Write-ColorOutput "`n=== FILTERING DROPPED PACKETS ===" "Cyan"
+   
+    if ($LogEntries.Count -eq 0) {
+        return @()
+    }
+    
+    # Use simple Where-Object for reliability
+    $droppedPackets = $LogEntries | Where-Object {
+        $_.action -eq "DROP" -or $_.action -eq "REJECT" -or $_.action -eq "BLOCK"
+    }
+   
+    Write-ColorOutput "✓ Found $($droppedPackets.Count) dropped/blocked packets out of $($LogEntries.Count) total entries" "Green"
+    return $droppedPackets
+}
+
+# Function to display detailed dropped packet information
+function Show-DroppedPacketDetails {
+    param([array]$DroppedPackets, [switch]$ShowTop10Only)
+   
+    if ($DroppedPackets.Count -eq 0) { 
+        Write-ColorOutput "No dropped packets to display." "Yellow"
+        return 
+    }
+   
+    Write-ColorOutput "`n=== DROPPED PACKET DETAILS ===" "Cyan"
+   
+    $displayCount = if ($ShowTop10Only) { [math]::Min(10, $DroppedPackets.Count) } else { [math]::Min(100, $DroppedPackets.Count) }
+   
+    # Sort by most recent first (safely)
+    $sortedPackets = $DroppedPackets | Where-Object { $_.DateTime } | Sort-Object DateTime -Descending
+    if ($sortedPackets.Count -eq 0) {
+        $sortedPackets = $DroppedPackets | Select-Object -First $displayCount
+    }
+   
+    Write-ColorOutput "Showing $displayCount most recent dropped packets:" "White"
+    Write-ColorOutput ("-" * 120) "Gray"
+   
+    try {
+        $sortedPackets | Select-Object -First $displayCount | Format-Table -Property @(
+            @{Name="DateTime"; Expression={$_.DateTime}; Width=20},
+            @{Name="Action"; Expression={$_.action}; Width=8},
+            @{Name="Protocol"; Expression={$_.protocol}; Width=8},
+            @{Name="Source IP"; Expression={$_.'src-ip'}; Width=15},
+            @{Name="Src Port"; Expression={$_.'src-port'}; Width=8},
+            @{Name="Dest IP"; Expression={$_.'dst-ip'}; Width=15},
+            @{Name="Dst Port"; Expression={$_.'dst-port'}; Width=8},
+            @{Name="Size"; Expression={$_.size}; Width=6}
+        ) -AutoSize
+    } catch {
+        Write-ColorOutput "Error displaying packet details: $($_.Exception.Message)" "Red"
+    }
+}
+
+# Optimized statistics with error handling
+function Show-SummaryStatistics {
+    param([array]$DroppedPackets)
+   
+    if ($DroppedPackets.Count -eq 0) { return }
+   
+    Write-ColorOutput "`n=== SUMMARY STATISTICS ===" "Cyan"
+   
+    try {
+        # Basic counts
+        Write-ColorOutput "Total Dropped Packets: $($DroppedPackets.Count)" "White"
+       
+        # Time range
+        $validDates = $DroppedPackets | Where-Object { $_.DateTime } | Sort-Object DateTime
+        if ($validDates.Count -gt 0) {
+            Write-ColorOutput "Time Range: $($validDates[0].DateTime) to $($validDates[-1].DateTime)" "White"
+        }
+       
+        # Use simple grouping for reliability
+        Write-ColorOutput "`n--- Protocol Distribution ---" "Yellow"
+        $protocolStats = $DroppedPackets | Group-Object protocol | Sort-Object Count -Descending
+        foreach ($proto in ($protocolStats | Select-Object -First 10)) {
+            $percentage = [math]::Round(($proto.Count / $DroppedPackets.Count) * 100, 1)
+            Write-ColorOutput "$($proto.Name): $($proto.Count) packets ($percentage%)" "White"
+        }
+       
+        # Top source IPs
+        Write-ColorOutput "`n--- Top 10 Source IPs ---" "Yellow"
+        $topSources = $DroppedPackets | Group-Object 'src-ip' | Sort-Object Count -Descending | Select-Object -First 10
+        foreach ($source in $topSources) {
+            Write-ColorOutput "$($source.Name): $($source.Count) attempts" "White"
+        }
+       
+        # Top destination ports
+        Write-ColorOutput "`n--- Top 10 Targeted Ports ---" "Yellow"
+        $topPorts = $DroppedPackets | Where-Object { $_.'dst-port' -ne "-" -and $_.'dst-port' } | Group-Object 'dst-port' | Sort-Object Count -Descending | Select-Object -First 10
+        foreach ($port in $topPorts) {
+            $portInfo = Get-PortDescription $port.Name
+            Write-ColorOutput "Port $($port.Name): $($port.Count) attempts $portInfo" "White"
+        }
+       
+        # Action distribution
+        Write-ColorOutput "`n--- Action Distribution ---" "Yellow"
+        $actionStats = $DroppedPackets | Group-Object action | Sort-Object Count -Descending
+        foreach ($action in $actionStats) {
+            Write-ColorOutput "$($action.Name): $($action.Count) packets" "White"
+        }
+    }
+    catch {
+        Write-ColorOutput "Error generating statistics: $($_.Exception.Message)" "Red"
+    }
+}
+
+# Port description lookup
+$script:PortDescriptions = @{
+    "21" = "(FTP)"; "22" = "(SSH)"; "23" = "(Telnet)"; "25" = "(SMTP)"; "53" = "(DNS)"
+    "80" = "(HTTP)"; "110" = "(POP3)"; "135" = "(RPC)"; "137" = "(NetBIOS Name)"
+    "138" = "(NetBIOS Datagram)"; "139" = "(NetBIOS Session)"; "143" = "(IMAP)"
+    "443" = "(HTTPS)"; "445" = "(SMB)"; "993" = "(IMAPS)"; "995" = "(POP3S)"
+    "1433" = "(SQL Server)"; "3389" = "(RDP)"; "5985" = "(WinRM HTTP)"; "5986" = "(WinRM HTTPS)"
+}
+
+function Get-PortDescription {
+    param([string]$Port)
+    if ($script:PortDescriptions.ContainsKey($Port)) {
+        return $script:PortDescriptions[$Port]
+    }
+    return ""
+}
+
+# Export function
+function Export-Results {
+    param([array]$DroppedPackets, [string]$ExportPath)
+   
+    if ($DroppedPackets.Count -eq 0 -or [string]::IsNullOrEmpty($ExportPath)) { return }
+   
+    Write-ColorOutput "`n=== EXPORTING RESULTS ===" "Cyan"
+   
+    try {
+        $DroppedPackets | Export-Csv -Path $ExportPath -NoTypeInformation -ErrorAction Stop
+        Write-ColorOutput "✓ Results exported to: $ExportPath" "Green"
+    } catch {
+        Write-ColorOutput "ERROR: Failed to export results: $($_.Exception.Message)" "Red"
+    }
+}
+
+# Security insights
+function Show-SecurityInsights {
+    param([array]$DroppedPackets)
+   
+    if ($DroppedPackets.Count -eq 0) { return }
+   
+    Write-ColorOutput "`n=== SECURITY INSIGHTS ===" "Cyan"
+   
+    try {
+        # Check for potential port scans
+        $sourceIPs = $DroppedPackets | Group-Object 'src-ip' | Where-Object { $_.Count -gt 10 }
+        if ($sourceIPs.Count -gt 0) {
+            Write-ColorOutput "⚠️  Potential Port Scanning Activity Detected:" "Red"
+            foreach ($ip in ($sourceIPs | Sort-Object Count -Descending | Select-Object -First 5)) {
+                $uniquePorts = ($DroppedPackets | Where-Object { $_.'src-ip' -eq $ip.Name } | Select-Object 'dst-port' -Unique).Count
+                Write-ColorOutput "   $($ip.Name): $($ip.Count) attempts across $uniquePorts different ports" "Yellow"
+            }
+        }
+       
+        # Check for brute force attempts
+        $commonServicePorts = @("22", "23", "3389", "21", "1433")
+        foreach ($port in $commonServicePorts) {
+            $attempts = $DroppedPackets | Where-Object { $_.'dst-port' -eq $port }
+            if ($attempts.Count -gt 5) {
+                $uniqueSources = ($attempts | Select-Object 'src-ip' -Unique).Count
+                $portDesc = Get-PortDescription $port
+                Write-ColorOutput "⚠️  High activity on port $port ${portDesc}: $($attempts.Count) attempts from $uniqueSources unique IPs" "Red"
+            }
+        }
+       
+        # Peak activity analysis
+        $validDates = $DroppedPackets | Where-Object { $_.DateTime }
+        if ($validDates.Count -gt 50) {
+            $hourlyStats = $validDates | Group-Object { $_.DateTime.Hour } | Sort-Object { [int]$_.Name }
+            $peakHour = $hourlyStats | Sort-Object Count -Descending | Select-Object -First 1
+            Write-ColorOutput "ℹ️  Peak activity hour: $($peakHour.Name):00 with $($peakHour.Count) dropped packets" "Blue"
+        }
+    }
+    catch {
+        Write-ColorOutput "Error in security analysis: $($_.Exception.Message)" "Red"
+    }
+}
+
+# Main execution with comprehensive error handling
+$stopwatch = [System.Diagnostics.Stopwatch]::StartNew()
+
+Write-ColorOutput "WINDOWS FIREWALL LOG ANALYZER (STABLE VERSION)" "Magenta"
+Write-ColorOutput "===============================================" "Magenta"
+
+try {
+    # Step 1: Validate log file
+    if (-not (Test-FirewallLogFile -Path $LogPath)) {
+        exit 1
+    }
+
+    # Step 2: Parse log file
+    Write-ColorOutput "Using $MaxThreads threads for parallel processing" "Cyan"
+    
+    if ($DisableParallel) {
+        Write-ColorOutput "Parallel processing disabled by user" "Yellow"
+        $logEntries = Parse-FirewallLogSequential -LogPath $LogPath -LastHours $LastHours
+    } else {
+        $logEntries = Parse-FirewallLogParallel -LogPath $LogPath -LastHours $LastHours -MaxThreads $MaxThreads
+    }
+
+    if ($logEntries.Count -eq 0) {
+        Write-ColorOutput "No valid log entries found. Exiting." "Red"
+        exit 1
+    }
+
+    # Step 3: Filter dropped packets
+    $droppedPackets = Get-DroppedPackets -LogEntries $logEntries
+
+    # Step 4: Display results
+    Show-DroppedPacketDetails -DroppedPackets $droppedPackets -ShowTop10Only:$ShowTop10Only
+
+    # Step 5: Show summary statistics
+    Show-SummaryStatistics -DroppedPackets $droppedPackets
+
+    # Step 6: Show security insights
+    Show-SecurityInsights -DroppedPackets $droppedPackets
+
+    # Step 7: Export if requested
+    if (-not [string]::IsNullOrEmpty($ExportPath)) {
+        Export-Results -DroppedPackets $droppedPackets -ExportPath $ExportPath
+    }
+
+    $stopwatch.Stop()
+    $elapsedTime = $stopwatch.Elapsed
+
+    Write-ColorOutput "`n=== ANALYSIS COMPLETE ===" "Magenta"
+    Write-ColorOutput "Analysis completed successfully in $($elapsedTime.TotalSeconds.ToString('F2')) seconds." "Green"
+    Write-ColorOutput "Processed $($logEntries.Count) total entries, found $($droppedPackets.Count) dropped packets." "Green"
+    
+    if ($elapsedTime.TotalSeconds -gt 0) {
+        Write-ColorOutput "Performance: $([math]::Round($logEntries.Count / $elapsedTime.TotalSeconds, 0)) entries/second" "Cyan"
+    }
+}
+catch {
+    Write-ColorOutput "`nCRITICAL ERROR: $($_.Exception.Message)" "Red"
+    Write-ColorOutput "Stack trace: $($_.ScriptStackTrace)" "Red"
+    Write-ColorOutput "`nTry running with -DisableParallel switch for troubleshooting" "Yellow"
+    exit 1
+}
+
+# Usage examples
+Write-ColorOutput "`nUsage Examples:" "Cyan"
+Write-ColorOutput "  .\FirewallLogAnalyzer.ps1" "Gray"
+Write-ColorOutput "  .\FirewallLogAnalyzer.ps1 -DisableParallel" "Gray"
+Write-ColorOutput "  .\FirewallLogAnalyzer.ps1 -MaxThreads 2 -ShowTop10Only" "Gray"
+Write-ColorOutput "  .\FirewallLogAnalyzer.ps1 -ExportPath 'C:\Reports\firewall.csv' -LastHours 24" "Gray"
