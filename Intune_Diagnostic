@@ -1,0 +1,665 @@
+#Requires -RunAsAdministrator
+
+<#
+.SYNOPSIS
+    Diagnoses common causes preventing a domain-joined Windows machine from syncing with Microsoft Intune.
+
+.DESCRIPTION
+    This script performs a comprehensive step-by-step diagnosis of Intune sync issues including:
+    - Azure AD join status verification
+    - MDM enrollment health checks
+    - Network connectivity tests
+    - Certificate validation
+    - Event log analysis
+    - Service status verification
+    - Compliance state evaluation
+
+.NOTES
+    Author: Stefan T.
+    Requires: Administrator privileges
+    Version: 2.1 (Clean)
+#>
+
+param(
+    [string]$ExpectedTenantName = "",
+    [string]$ExpectedTenantId = "",
+    [switch]$Detailed,
+    [switch]$ExportResults
+)
+
+# Initialize results object
+$DiagnosticResults = [PSCustomObject]@{
+    Timestamp = Get-Date
+    ComputerName = $env:COMPUTERNAME
+    AzureADJoinStatus = $null
+    MDMEnrollmentStatus = $null
+    NetworkConnectivity = $null
+    CertificateStatus = $null
+    ScheduledTaskStatus = $null
+    EventLogAnalysis = $null
+    ServiceStatus = $null
+    ComplianceStatus = $null
+    OverallStatus = "Unknown"
+    Recommendations = @()
+}
+
+# Color coding for output
+function Write-StatusMessage {
+    param(
+        [string]$Message,
+        [ValidateSet("Info", "Success", "Warning", "Error")]
+        [string]$Type = "Info"
+    )
+    
+    $colors = @{
+        "Info" = "Cyan"
+        "Success" = "Green" 
+        "Warning" = "Yellow"
+        "Error" = "Red"
+    }
+    
+    Write-Host "[$Type] " -ForegroundColor $colors[$Type] -NoNewline
+    Write-Host $Message
+}
+
+function Test-IsAdmin {
+    $currentUser = [Security.Principal.WindowsIdentity]::GetCurrent()
+    $principal = New-Object Security.Principal.WindowsPrincipal($currentUser)
+    return $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)
+}
+
+# Step 1: Check Azure AD Join Status
+function Test-AzureADJoinStatus {
+    Write-StatusMessage "Step 1: Checking Azure AD Join Status..." -Type "Info"
+    
+    try {
+        $dsregResult = & dsregcmd /status
+        $joinStatus = [PSCustomObject]@{
+            AzureAdJoined = $false
+            DeviceId = $null
+            TenantName = $null
+            TenantId = $null
+            JoinType = "Unknown"
+            Issues = @()
+        }
+        
+        foreach ($line in $dsregResult) {
+            if ($line -match "AzureAdJoined\s*:\s*(.+)") {
+                $joinStatus.AzureAdJoined = $matches[1].Trim() -eq "YES"
+            }
+            elseif ($line -match "DeviceId\s*:\s*(.+)") {
+                $joinStatus.DeviceId = $matches[1].Trim()
+            }
+            elseif ($line -match "TenantName\s*:\s*(.+)") {
+                $joinStatus.TenantName = $matches[1].Trim()
+            }
+            elseif ($line -match "TenantId\s*:\s*(.+)") {
+                $joinStatus.TenantId = $matches[1].Trim()
+            }
+            elseif ($line -match "DomainJoined\s*:\s*YES") {
+                $joinStatus.JoinType = "Hybrid"
+            }
+        }
+        
+        # Validate join status
+        if (-not $joinStatus.AzureAdJoined) {
+            $joinStatus.Issues += "Device is not Azure AD joined"
+            Write-StatusMessage "Device is not Azure AD joined" -Type "Error"
+        } else {
+            Write-StatusMessage "Device is Azure AD joined" -Type "Success"
+        }
+        
+        if ([string]::IsNullOrEmpty($joinStatus.DeviceId)) {
+            $joinStatus.Issues += "No Device ID found"
+            Write-StatusMessage "No Device ID found" -Type "Error"
+        } else {
+            Write-StatusMessage "Device ID: $($joinStatus.DeviceId)" -Type "Success"
+        }
+        
+        # Check expected tenant if provided
+        if ($ExpectedTenantName -and $joinStatus.TenantName -ne $ExpectedTenantName) {
+            $joinStatus.Issues += "Tenant name mismatch. Expected: $ExpectedTenantName, Found: $($joinStatus.TenantName)"
+            Write-StatusMessage "Tenant name mismatch" -Type "Warning"
+        }
+        
+        if ($ExpectedTenantId -and $joinStatus.TenantId -ne $ExpectedTenantId) {
+            $joinStatus.Issues += "Tenant ID mismatch. Expected: $ExpectedTenantId, Found: $($joinStatus.TenantId)"
+            Write-StatusMessage "Tenant ID mismatch" -Type "Warning"
+        }
+        
+        return $joinStatus
+    }
+    catch {
+        Write-StatusMessage "Failed to check Azure AD join status: $($_.Exception.Message)" -Type "Error"
+        return [PSCustomObject]@{
+            AzureAdJoined = $false
+            Issues = @("Failed to execute dsregcmd: $($_.Exception.Message)")
+        }
+    }
+}
+
+# Step 2: Verify MDM Enrollment
+function Test-MDMEnrollment {
+    Write-StatusMessage "Step 2: Verifying MDM Enrollment..." -Type "Info"
+    
+    $enrollmentStatus = [PSCustomObject]@{
+        IsEnrolled = $false
+        EnrollmentGUID = $null
+        DiscoveryServiceURL = $null
+        LastSuccessTime = $null
+        Issues = @()
+    }
+    
+    try {
+        # Check Enrollments registry
+        $enrollmentsPath = "HKLM:\SOFTWARE\Microsoft\Enrollments"
+        if (Test-Path $enrollmentsPath) {
+            $enrollmentKeys = Get-ChildItem $enrollmentsPath -ErrorAction SilentlyContinue
+            
+            foreach ($key in $enrollmentKeys) {
+                $enrollmentData = Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue
+                if ($enrollmentData.ProviderID -eq "MS DM Server") {
+                    $enrollmentStatus.IsEnrolled = $true
+                    $enrollmentStatus.EnrollmentGUID = $key.PSChildName
+                    Write-StatusMessage "Found MDM enrollment: $($key.PSChildName)" -Type "Success"
+                    break
+                }
+            }
+        }
+        
+        # Check EnterpriseMgmt registry
+        $enterpriseMgmtPath = "HKLM:\SOFTWARE\Microsoft\EnterpriseMgmt"
+        if (Test-Path $enterpriseMgmtPath) {
+            $mgmtKeys = Get-ChildItem $enterpriseMgmtPath -ErrorAction SilentlyContinue
+            
+            foreach ($key in $mgmtKeys) {
+                $mgmtData = Get-ItemProperty $key.PSPath -ErrorAction SilentlyContinue
+                if ($mgmtData.DiscoveryServiceFullURL) {
+                    $enrollmentStatus.DiscoveryServiceURL = $mgmtData.DiscoveryServiceFullURL
+                    Write-StatusMessage "Discovery Service URL: $($mgmtData.DiscoveryServiceFullURL)" -Type "Info"
+                }
+            }
+        }
+        
+        if (-not $enrollmentStatus.IsEnrolled) {
+            $enrollmentStatus.Issues += "No MDM enrollment found in registry"
+            Write-StatusMessage "No MDM enrollment found" -Type "Error"
+        }
+        
+        return $enrollmentStatus
+    }
+    catch {
+        $enrollmentStatus.Issues += "Failed to check MDM enrollment: $($_.Exception.Message)"
+        Write-StatusMessage "Failed to check MDM enrollment: $($_.Exception.Message)" -Type "Error"
+        return $enrollmentStatus
+    }
+}
+
+# Step 3: Test Network Connectivity
+function Test-IntuneConnectivity {
+    Write-StatusMessage "Step 3: Testing Network Connectivity to Intune Endpoints..." -Type "Info"
+    
+    $endpoints = @(
+        "https://login.microsoftonline.com",
+        "https://enrollment.manage.microsoft.com", 
+        "https://portal.manage.microsoft.com",
+        "https://graph.microsoft.com"
+    )
+    
+    $connectivityResults = [PSCustomObject]@{
+        TestResults = @()
+        AllEndpointsReachable = $true
+        Issues = @()
+    }
+    
+    foreach ($endpoint in $endpoints) {
+        try {
+            $uri = [System.Uri]$endpoint
+            $testResult = Test-NetConnection -ComputerName $uri.Host -Port 443 -InformationLevel Quiet
+            
+            $endpointResult = [PSCustomObject]@{
+                Endpoint = $endpoint
+                Reachable = $testResult
+                ResponseTime = $null
+            }
+            
+            if ($testResult) {
+                # Test HTTP response
+                try {
+                    $response = Invoke-WebRequest -Uri $endpoint -Method Head -TimeoutSec 10 -UseBasicParsing
+                    $endpointResult.ResponseTime = $response.Headers.'X-Response-Time'
+                    Write-StatusMessage "$endpoint - Reachable (HTTP $($response.StatusCode))" -Type "Success"
+                }
+                catch {
+                    Write-StatusMessage "$endpoint - TCP reachable but HTTP failed: $($_.Exception.Message)" -Type "Warning"
+                }
+            } else {
+                $connectivityResults.AllEndpointsReachable = $false
+                $connectivityResults.Issues += "$endpoint is not reachable"
+                Write-StatusMessage "$endpoint - Not reachable" -Type "Error"
+            }
+            
+            $connectivityResults.TestResults += $endpointResult
+        }
+        catch {
+            $connectivityResults.AllEndpointsReachable = $false
+            $connectivityResults.Issues += "Failed to test $endpoint : $($_.Exception.Message)"
+            Write-StatusMessage "Failed to test $endpoint : $($_.Exception.Message)" -Type "Error"
+        }
+    }
+    
+    return $connectivityResults
+}
+
+# Step 4: Check MDM Certificates
+function Test-MDMCertificates {
+    Write-StatusMessage "Step 4: Examining MDM Certificates..." -Type "Info"
+    
+    $certificateStatus = [PSCustomObject]@{
+        MDMCertificatesFound = 0
+        ValidCertificates = 0
+        ExpiredCertificates = 0
+        CertificateDetails = @()
+        Issues = @()
+    }
+    
+    try {
+        $certificates = Get-ChildItem Cert:\LocalMachine\My | Where-Object {
+            $_.Issuer -like "*Microsoft Intune*" -or 
+            $_.Subject -like "*Microsoft MDM*" -or
+            $_.Issuer -like "*MS-Organization-Access*"
+        }
+        
+        $certificateStatus.MDMCertificatesFound = $certificates.Count
+        
+        foreach ($cert in $certificates) {
+            $certDetail = [PSCustomObject]@{
+                Subject = $cert.Subject
+                Issuer = $cert.Issuer
+                NotBefore = $cert.NotBefore
+                NotAfter = $cert.NotAfter
+                IsValid = $cert.NotAfter -gt (Get-Date)
+                Thumbprint = $cert.Thumbprint
+            }
+            
+            if ($certDetail.IsValid) {
+                $certificateStatus.ValidCertificates++
+                Write-StatusMessage "Valid MDM certificate found: $($cert.Subject)" -Type "Success"
+            } else {
+                $certificateStatus.ExpiredCertificates++
+                $certificateStatus.Issues += "Expired certificate: $($cert.Subject) (Expired: $($cert.NotAfter))"
+                Write-StatusMessage "Expired MDM certificate: $($cert.Subject)" -Type "Warning"
+            }
+            
+            $certificateStatus.CertificateDetails += $certDetail
+        }
+        
+        if ($certificateStatus.MDMCertificatesFound -eq 0) {
+            $certificateStatus.Issues += "No MDM certificates found in certificate store"
+            Write-StatusMessage "No MDM certificates found" -Type "Error"
+        }
+        
+        return $certificateStatus
+    }
+    catch {
+        $certificateStatus.Issues += "Failed to check certificates: $($_.Exception.Message)"
+        Write-StatusMessage "Failed to check certificates: $($_.Exception.Message)" -Type "Error"
+        return $certificateStatus
+    }
+}
+
+# Step 5: Check Scheduled Tasks
+function Test-MDMScheduledTasks {
+    Write-StatusMessage "Step 5: Checking MDM Scheduled Tasks..." -Type "Info"
+    
+    $taskStatus = [PSCustomObject]@{
+        TasksFound = 0
+        RunningTasks = 0
+        FailedTasks = 0
+        TaskDetails = @()
+        Issues = @()
+    }
+    
+    try {
+        $mdmTasks = Get-ScheduledTask | Where-Object { 
+            $_.TaskPath -like "*EnterpriseMgmt*" -or 
+            $_.TaskName -like "*MDM*" -or
+            $_.TaskPath -like "*Microsoft\Windows\EnterpriseMgmt*"
+        }
+        
+        $taskStatus.TasksFound = $mdmTasks.Count
+        
+        foreach ($task in $mdmTasks) {
+            $taskInfo = Get-ScheduledTaskInfo $task.TaskName -ErrorAction SilentlyContinue
+            
+            $taskDetail = [PSCustomObject]@{
+                TaskName = $task.TaskName
+                TaskPath = $task.TaskPath
+                State = $task.State
+                LastRunTime = $taskInfo.LastRunTime
+                LastTaskResult = $taskInfo.LastTaskResult
+                NextRunTime = $taskInfo.NextRunTime
+            }
+            
+            if ($task.State -eq "Running") {
+                $taskStatus.RunningTasks++
+                Write-StatusMessage "Task running: $($task.TaskName)" -Type "Success"
+            } elseif ($taskInfo.LastTaskResult -ne 0) {
+                $taskStatus.FailedTasks++
+                $taskStatus.Issues += "Task failed: $($task.TaskName) (Result: $($taskInfo.LastTaskResult))"
+                Write-StatusMessage "Task failed: $($task.TaskName) (Result: $($taskInfo.LastTaskResult))" -Type "Warning"
+            } else {
+                Write-StatusMessage "Task OK: $($task.TaskName)" -Type "Success"
+            }
+            
+            $taskStatus.TaskDetails += $taskDetail
+        }
+        
+        if ($taskStatus.TasksFound -eq 0) {
+            $taskStatus.Issues += "No MDM scheduled tasks found"
+            Write-StatusMessage "No MDM scheduled tasks found" -Type "Error"
+        }
+        
+        return $taskStatus
+    }
+    catch {
+        $taskStatus.Issues += "Failed to check scheduled tasks: $($_.Exception.Message)"
+        Write-StatusMessage "Failed to check scheduled tasks: $($_.Exception.Message)" -Type "Error"
+        return $taskStatus
+    }
+}
+
+# Step 6: Review Event Logs
+function Test-EventLogs {
+    Write-StatusMessage "Step 6: Reviewing Event Logs..." -Type "Info"
+    
+    $eventLogStatus = [PSCustomObject]@{
+        CriticalErrors = 0
+        Warnings = 0
+        RecentEvents = @()
+        Issues = @()
+    }
+    
+    try {
+        # Define log sources and event IDs to check
+        $logSources = @(
+            @{LogName = "Microsoft-Windows-DeviceManagement-Enterprise-Diagnostics-Provider/Admin"; EventIDs = @(75, 76, 201, 301, 1008)},
+            @{LogName = "Application"; EventIDs = @(1000, 1001)},
+            @{LogName = "System"; EventIDs = @(7000, 7001, 7009, 7023, 7024)}
+        )
+        
+        $startTime = (Get-Date).AddDays(-7)  # Check last 7 days
+        
+        foreach ($logSource in $logSources) {
+            try {
+                $events = Get-WinEvent -LogName $logSource.LogName -MaxEvents 100 -ErrorAction SilentlyContinue | 
+                    Where-Object { 
+                        $_.TimeCreated -gt $startTime -and 
+                        ($logSource.EventIDs -contains $_.Id)
+                    }
+                
+                foreach ($event in $events) {
+                    $eventDetail = [PSCustomObject]@{
+                        LogName = $logSource.LogName
+                        EventID = $event.Id
+                        Level = $event.LevelDisplayName
+                        TimeCreated = $event.TimeCreated
+                        Message = $event.Message.Substring(0, [Math]::Min(200, $event.Message.Length))
+                    }
+                    
+                    if ($event.Level -eq 2) {  # Error
+                        $eventLogStatus.CriticalErrors++
+                        Write-StatusMessage "Critical error found: Event ID $($event.Id) at $($event.TimeCreated)" -Type "Error"
+                    } elseif ($event.Level -eq 3) {  # Warning
+                        $eventLogStatus.Warnings++
+                        Write-StatusMessage "Warning found: Event ID $($event.Id) at $($event.TimeCreated)" -Type "Warning"
+                    }
+                    
+                    $eventLogStatus.RecentEvents += $eventDetail
+                }
+            }
+            catch {
+                # Log might not exist, continue
+                continue
+            }
+        }
+        
+        Write-StatusMessage "Found $($eventLogStatus.CriticalErrors) critical errors and $($eventLogStatus.Warnings) warnings" -Type "Info"
+        
+        return $eventLogStatus
+    }
+    catch {
+        $eventLogStatus.Issues += "Failed to check event logs: $($_.Exception.Message)"
+        Write-StatusMessage "Failed to check event logs: $($_.Exception.Message)" -Type "Error"
+        return $eventLogStatus
+    }
+}
+
+# Step 7: Check Windows Services
+function Test-WindowsServices {
+    Write-StatusMessage "Step 7: Checking Windows Services..." -Type "Info"
+    
+    $serviceStatus = [PSCustomObject]@{
+        ServicesChecked = 0
+        RunningServices = 0
+        StoppedServices = 0
+        ServiceDetails = @()
+        Issues = @()
+    }
+    
+    $requiredServices = @(
+        "dmwappushservice",
+        "DeviceManagementEnrollmentService", 
+        "IntuneManagementExtension",
+        "Windows Push Notifications User Service",
+        "Microsoft Account Sign-in Assistant"
+    )
+    
+    foreach ($serviceName in $requiredServices) {
+        try {
+            $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue
+            
+            if ($service) {
+                $serviceDetail = [PSCustomObject]@{
+                    ServiceName = $service.Name
+                    DisplayName = $service.DisplayName
+                    Status = $service.Status
+                    StartType = $service.StartType
+                }
+                
+                $serviceStatus.ServicesChecked++
+                
+                if ($service.Status -eq "Running") {
+                    $serviceStatus.RunningServices++
+                    Write-StatusMessage "$($service.DisplayName) is running" -Type "Success"
+                } else {
+                    $serviceStatus.StoppedServices++
+                    $serviceStatus.Issues += "$($service.DisplayName) is not running (Status: $($service.Status))"
+                    Write-StatusMessage "$($service.DisplayName) is not running" -Type "Warning"
+                }
+                
+                $serviceStatus.ServiceDetails += $serviceDetail
+            } else {
+                $serviceStatus.Issues += "Service not found: $serviceName"
+                Write-StatusMessage "Service not found: $serviceName" -Type "Warning"
+            }
+        }
+        catch {
+            $serviceStatus.Issues += "Failed to check service $serviceName : $($_.Exception.Message)"
+            Write-StatusMessage "Failed to check service $serviceName : $($_.Exception.Message)" -Type "Error"
+        }
+    }
+    
+    return $serviceStatus
+}
+
+# Step 8: Check Device Compliance
+function Test-DeviceCompliance {
+    Write-StatusMessage "Step 8: Evaluating Device Compliance..." -Type "Info"
+    
+    $complianceStatus = [PSCustomObject]@{
+        ComplianceState = "Unknown"
+        LastSyncAttempt = $null
+        PolicyCount = 0
+        Issues = @()
+    }
+    
+    try {
+        # Try to trigger a manual sync
+        $syncCommand = 'Get-ScheduledTask -TaskName "*Intune*" | Start-ScheduledTask -ErrorAction SilentlyContinue'
+        Invoke-Expression $syncCommand
+        
+        # Check for compliance policies in registry
+        $compliancePath = "HKLM:\SOFTWARE\Microsoft\EnterpriseMgmt"
+        if (Test-Path $compliancePath) {
+            $mgmtKeys = Get-ChildItem $compliancePath -Recurse | Where-Object { $_.Name -like "*Policy*" }
+            $complianceStatus.PolicyCount = $mgmtKeys.Count
+            Write-StatusMessage "Found $($mgmtKeys.Count) policy entries" -Type "Info"
+        }
+        
+        # Try to get last sync time from WMI
+        try {
+            $mdmDeviceInfo = Get-CimInstance -Namespace "root\cimv2\mdm\dmmap" -ClassName "MDM_DevDetail_Ext01" -ErrorAction SilentlyContinue
+            if ($mdmDeviceInfo) {
+                Write-StatusMessage "Device management info retrieved successfully" -Type "Success"
+                $complianceStatus.ComplianceState = "Managed"
+            }
+        }
+        catch {
+            $complianceStatus.Issues += "Unable to retrieve device management info"
+            Write-StatusMessage "Unable to retrieve device management info" -Type "Warning"
+        }
+        
+        return $complianceStatus
+    }
+    catch {
+        $complianceStatus.Issues += "Failed to check device compliance: $($_.Exception.Message)"
+        Write-StatusMessage "Failed to check device compliance: $($_.Exception.Message)" -Type "Error"
+        return $complianceStatus
+    }
+}
+
+# Generate recommendations based on findings
+function Get-Recommendations {
+    param($Results)
+    
+    $recommendations = @()
+    
+    # Azure AD Join recommendations
+    if (-not $Results.AzureADJoinStatus.AzureAdJoined) {
+        $recommendations += "Run 'dsregcmd /join' to join the device to Azure AD"
+    }
+    
+    # MDM Enrollment recommendations
+    if (-not $Results.MDMEnrollmentStatus.IsEnrolled) {
+        $recommendations += "Enroll the device in MDM using Settings > Accounts > Work or School"
+        $recommendations += "Check if automatic MDM enrollment is configured in Azure AD"
+    }
+    
+    # Connectivity recommendations
+    if (-not $Results.NetworkConnectivity.AllEndpointsReachable) {
+        $recommendations += "Check firewall and proxy settings for Intune endpoints"
+        $recommendations += "Verify internet connectivity and DNS resolution"
+    }
+    
+    # Certificate recommendations
+    if ($Results.CertificateStatus.ValidCertificates -eq 0) {
+        $recommendations += "Re-enroll the device to obtain valid MDM certificates"
+        $recommendations += "Clear existing certificates and re-register with Intune"
+    }
+    
+    # Service recommendations
+    if ($Results.ServiceStatus.StoppedServices -gt 0) {
+        $recommendations += "Start stopped MDM-related services"
+        $recommendations += "Check Windows Update and restart if needed"
+    }
+    
+    # Event log recommendations
+    if ($Results.EventLogAnalysis.CriticalErrors -gt 0) {
+        $recommendations += "Review event logs for specific error messages and solutions"
+        $recommendations += "Check Microsoft documentation for specific Event IDs"
+    }
+    
+    return $recommendations
+}
+
+# Main execution function
+function Start-IntuneDiagnostics {
+    Write-Host "`n=== Microsoft Intune Sync Diagnostic Tool ===" -ForegroundColor Cyan
+    Write-Host "Starting comprehensive diagnosis...`n" -ForegroundColor Cyan
+    
+    if (-not (Test-IsAdmin)) {
+        Write-StatusMessage "This script requires administrator privileges. Please run as administrator." -Type "Error"
+        exit 1
+    }
+    
+    # Execute all diagnostic steps
+    $DiagnosticResults.AzureADJoinStatus = Test-AzureADJoinStatus
+    $DiagnosticResults.MDMEnrollmentStatus = Test-MDMEnrollment
+    $DiagnosticResults.NetworkConnectivity = Test-IntuneConnectivity
+    $DiagnosticResults.CertificateStatus = Test-MDMCertificates
+    $DiagnosticResults.ScheduledTaskStatus = Test-MDMScheduledTasks
+    $DiagnosticResults.EventLogAnalysis = Test-EventLogs
+    $DiagnosticResults.ServiceStatus = Test-WindowsServices
+    $DiagnosticResults.ComplianceStatus = Test-DeviceCompliance
+    
+    # Generate recommendations
+    $DiagnosticResults.Recommendations = Get-Recommendations -Results $DiagnosticResults
+    
+    # Determine overall status
+    $criticalIssues = 0
+    if (-not $DiagnosticResults.AzureADJoinStatus.AzureAdJoined) { $criticalIssues++ }
+    if (-not $DiagnosticResults.MDMEnrollmentStatus.IsEnrolled) { $criticalIssues++ }
+    if (-not $DiagnosticResults.NetworkConnectivity.AllEndpointsReachable) { $criticalIssues++ }
+    
+    if ($criticalIssues -eq 0) {
+        $DiagnosticResults.OverallStatus = "Healthy"
+    } elseif ($criticalIssues -le 2) {
+        $DiagnosticResults.OverallStatus = "Issues Detected"
+    } else {
+        $DiagnosticResults.OverallStatus = "Critical Issues"
+    }
+    
+    # Display summary
+    Write-Host "`n=== DIAGNOSTIC SUMMARY ===" -ForegroundColor Cyan
+    Write-Host "Overall Status: " -NoNewline
+    
+    switch ($DiagnosticResults.OverallStatus) {
+        "Healthy" { Write-Host $DiagnosticResults.OverallStatus -ForegroundColor Green }
+        "Issues Detected" { Write-Host $DiagnosticResults.OverallStatus -ForegroundColor Yellow }
+        "Critical Issues" { Write-Host $DiagnosticResults.OverallStatus -ForegroundColor Red }
+    }
+    
+    Write-Host "`nKey Findings:" -ForegroundColor Cyan
+    Write-Host "✓ Azure AD Joined: $($DiagnosticResults.AzureADJoinStatus.AzureAdJoined)" -ForegroundColor $(if($DiagnosticResults.AzureADJoinStatus.AzureAdJoined) {"Green"} else {"Red"})
+    Write-Host "✓ MDM Enrolled: $($DiagnosticResults.MDMEnrollmentStatus.IsEnrolled)" -ForegroundColor $(if($DiagnosticResults.MDMEnrollmentStatus.IsEnrolled) {"Green"} else {"Red"})
+    Write-Host "✓ Network Connectivity: $($DiagnosticResults.NetworkConnectivity.AllEndpointsReachable)" -ForegroundColor $(if($DiagnosticResults.NetworkConnectivity.AllEndpointsReachable) {"Green"} else {"Red"})
+    Write-Host "✓ Valid Certificates: $($DiagnosticResults.CertificateStatus.ValidCertificates)" -ForegroundColor $(if($DiagnosticResults.CertificateStatus.ValidCertificates -gt 0) {"Green"} else {"Red"})
+    Write-Host "✓ Running Services: $($DiagnosticResults.ServiceStatus.RunningServices)/$($DiagnosticResults.ServiceStatus.ServicesChecked)" -ForegroundColor $(if($DiagnosticResults.ServiceStatus.RunningServices -eq $DiagnosticResults.ServiceStatus.ServicesChecked) {"Green"} else {"Yellow"})
+    
+    if ($DiagnosticResults.Recommendations.Count -gt 0) {
+        Write-Host "`nRecommendations:" -ForegroundColor Cyan
+        foreach ($recommendation in $DiagnosticResults.Recommendations) {
+            Write-Host "• $recommendation" -ForegroundColor Yellow
+        }
+    }
+    
+    # Export results if requested
+    if ($ExportResults) {
+        $exportPath = "IntuneDiagnostics_$(Get-Date -Format 'yyyyMMdd_HHmmss').json"
+        $DiagnosticResults | ConvertTo-Json -Depth 10 | Out-File -FilePath $exportPath -Encoding UTF8
+        Write-StatusMessage "Results exported to: $exportPath" -Type "Success"
+    }
+    
+    if ($Detailed) {
+        Write-Host "`n=== DETAILED RESULTS ===" -ForegroundColor Cyan
+        $DiagnosticResults | ConvertTo-Json -Depth 5 | Write-Host
+    }
+    
+    return $DiagnosticResults
+}
+
+# Execute the diagnostics
+Write-Host "Initializing Intune Diagnostic Tool..." -ForegroundColor Green
+$Results = Start-IntuneDiagnostics
+Write-Host "`nDiagnostic completed. Use -Detailed switch for verbose output or -ExportResults to save to file." -ForegroundColor Cyan
